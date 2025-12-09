@@ -3,6 +3,7 @@ import grc_validation
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
+from datetime import date
 
 def main():
 
@@ -19,23 +20,38 @@ def main():
     pdf = "reports/aws_control_status_report.pdf"
     oi_client = OpenAI(api_key=OI)
     config_client = boto3.client('config')
-    rule_name="root-account-mfa-enabled"
+    # rule_name="root-account-mfa-enabled"
 
     # Get Status of security controls
-    status = grc_validation.get_control_status(rule_name, config_client)
+    statuses = grc_validation.get_all_control_statuses(config_client)
 
+    # Summarize the statuses for the prompt
+    status_summary = grc_validation.build_status_summary(statuses)
+    
     # Build the prompt
     prompt = f"""
-    You're a cybersecurity analyst. Generate a short compliance status summary report for an AWS Config rule that checks whether root account MFA is enabled.
+    You are a security risk analyst. Analyze the AWS Config rule control status summary below and generate a report.
+    
+    On the first page, the report header should include:
+    - Title as AWS Control Status Report
+    - Date of report is {date.today()}
 
-    The current status is: """ + status + """
+    For each rule, include:
+    - A short description of what it checks for
+    - Why it's important for cloud security or risk mitigation
+    - What the current compliance status means
+    - If it's NON_COMPLIANT, include the resource details that are non-compliant and clear recommendations for remediation
 
-    Include in your summary:
-    - What this rule checks for
-    - Why it matters
-    - What the current status means
-    - If it's NON_COMPLIANT, include a recommendation
-    """
+    Compliance Summary:
+    
+    {status_summary}
+    
+    Instructions:
+    - Do NOT use Markdown symbols (like #, *, **)
+    - Format using plain text with clear headings
+    - Use proper capitalization and spacing
+    - Write the report in clear, concise language that a risk or GRC stakeholder would understand
+    - Number and bold each rule name."""
 
     # Generate Report
     grc_validation.generate_report(prompt, pdf, oi_client)
