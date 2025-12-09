@@ -20,7 +20,6 @@ def main():
     pdf = "reports/aws_control_status_report.pdf"
     oi_client = OpenAI(api_key=OI)
     config_client = boto3.client('config')
-    # rule_name="root-account-mfa-enabled"
 
     # Get Status of security controls
     statuses = grc_validation.get_all_control_statuses(config_client)
