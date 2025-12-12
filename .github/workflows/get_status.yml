@@ -1,0 +1,36 @@
+name: Upload AWS Control Statuses to ServiceNow
+
+on:
+  schedule:
+    - cron: '0 14 * * 5'   # every week
+  workflow_dispatch:     # manual trigger optional
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    env:
+      SN_I: ${{ secrets.SN_I }}
+      SN_T: ${{ secrets.SN_T }}
+      SN_U: ${{ secrets.SN_U }}
+      SN_P: ${{ secrets.SN_P }}
+      AAK_ID: ${{ secrets.AAK_ID }}
+      AS_A: ${{ secrets.AS_A }}
+      AD_R: ${{ secrets.AD_R }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run:
+          pip install -r requirements.txt
+
+      - name: Run sync script
+        run:
+          python main.py

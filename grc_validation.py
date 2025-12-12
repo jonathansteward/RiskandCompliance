@@ -5,6 +5,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from email.mime.text import MIMEText
 from textwrap import wrap
+import requests
+from requests.auth import HTTPBasicAuth
 
 # Build the summary for the prompt
 def build_status_summary(statuses):
@@ -24,7 +26,7 @@ def build_status_summary(statuses):
 
 # Gets the status of AWS Config rules
 def get_all_control_statuses(config_client):
-    
+
     statuses = {}
 
     # Get all compliance statuses
@@ -49,6 +51,51 @@ def get_all_control_statuses(config_client):
             statuses[rule_name] = rule_info
 
     return statuses
+
+def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
+    
+    base_url = f"https://{sn_i}.service-now.com/api/now/table/{sn_t}"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    for rule_name, info in statuses.items():
+        control_status = info.get("compliance", "UNKNOWN")
+
+        # Step 1: Check if rule already exists by rule_name
+        query_url = f"{base_url}?sysparm_query=u_aws_config_rule_name={rule_name}&sysparm_limit=1"
+        get_response = requests.get(query_url, auth=(sn_u, sn_p), headers=headers)
+
+        if get_response.status_code == 200:
+            results = get_response.json().get("result", [])
+            if results:
+                # Rule exists — use PATCH to update
+                sys_id = results[0]['sys_id']
+                patch_url = f"{base_url}/{sys_id}"
+                payload = {"u_status": control_status}
+
+                patch_response = requests.patch(patch_url, auth=(sn_u, sn_p), headers=headers, json=payload)
+                if patch_response.status_code == 200:
+                    print(f"Updated: {rule_name} - {control_status}")
+                else:
+                    print(f"Failed to update {rule_name}. Status: {patch_response.status_code}")
+                    print(patch_response.text)
+            else:
+                # Rule does not exist — use POST to create
+                payload = {
+                    "u_aws_config_rule_name": rule_name,
+                    "u_status": control_status
+                }
+                post_response = requests.post(base_url, auth=(sn_u, sn_p), headers=headers, json=payload)
+                if post_response.status_code in [200, 201]:
+                    print(f"Created: {rule_name} - {control_status}")
+                else:
+                    print(f"Failed to create {rule_name}. Status: {post_response.status_code}")
+                    print(post_response.text)
+        else:
+            print(f"Failed to query for {rule_name}. Status: {get_response.status_code}")
+            print(get_response.text)
 
 # Generates reports
 def generate_report(prompt, pdf, oi_client):
