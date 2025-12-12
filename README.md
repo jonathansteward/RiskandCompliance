@@ -1,2 +1,2 @@
 # RiskandCompliance
-The goal of this project is to expand on my existing GRC knowledge by combining it with my Computer Science and technical background to engineer and automate risk and compliance.
+Automating AWS security control status checks using AWS Config, Python, and ChatGPT to apply my automation and programming background to engineer and automate risk and compliance.
