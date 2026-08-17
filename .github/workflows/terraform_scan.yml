@@ -109,3 +109,23 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $CONFTEST_EXIT
+
+  compliance-gate:
+    name: Compliance Gate
+    # Matrix jobs get a per-directory context name (e.g. "Compliance Check
+    # (terraform/examples/foo)"), which is unusable as a required status
+    # check - a PR touching a different directory would never satisfy it and
+    # would block forever. This job always runs under one stable name and
+    # fails if any matrixed check failed, so branch protection has one
+    # consistent context to require.
+    needs: [detect-changed-examples, compliance-check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate gate
+        run: |
+          if [ "${{ needs.compliance-check.result }}" == "failure" ]; then
+            echo "One or more Terraform plans failed compliance checks."
+            exit 1
+          fi
+          echo "All scanned directories passed (or none needed scanning)."
