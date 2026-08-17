@@ -8,3 +8,4 @@
 *.tfstate.backup
 crash.log
 tfplan
+/IMPLEMENTATION_PLAN.md
