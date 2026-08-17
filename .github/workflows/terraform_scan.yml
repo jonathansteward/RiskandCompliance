@@ -1,10 +1,13 @@
 name: Terraform Compliance Gate
 
 on:
-  pull_request:
-    paths:
-      - "terraform/examples/**"
-      - "terraform/policy/**"
+  pull_request: {}
+  # Deliberately no `paths:` filter. `Compliance Gate` is a required status
+  # check in branch protection, which needs it to report *success* on every
+  # PR - a path filter would mean non-Terraform PRs never get a status at
+  # all and stay permanently blocked. detect-changed-examples finds nothing
+  # to scan on those PRs, compliance-check is skipped, and compliance-gate
+  # still runs and passes trivially (it only fails on an actual failure).
 
 permissions:
   contents: read
