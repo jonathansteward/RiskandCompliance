@@ -1,3 +1,4 @@
+import json
 import requests
 from requests.auth import HTTPBasicAuth
 
@@ -45,8 +46,21 @@ def get_all_control_statuses(config_client):
 
     return statuses
 
+def build_resource_detail(info):
+    """Serialize non-compliant resource detail for storage in ServiceNow.
+
+    Always returns a string (empty if there's nothing to report), so a
+    control that goes from NON_COMPLIANT back to COMPLIANT overwrites the
+    stale detail from its last failing run instead of leaving it behind.
+    """
+    resources = info.get("resources", [])
+    if not resources:
+        return ""
+    return json.dumps(resources)
+
+
 def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
-    
+
     base_url = f"https://{sn_i}.service-now.com/api/now/table/{sn_t}"
     headers = {
         "Content-Type": "application/json",
@@ -55,6 +69,7 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
 
     for rule_name, info in statuses.items():
         control_status = info.get("compliance", "UNKNOWN")
+        resource_detail = build_resource_detail(info)
 
         # Step 1: Check if rule already exists by rule_name
         query_url = f"{base_url}?sysparm_query=u_aws_config_rule_name={rule_name}&sysparm_limit=1"
@@ -66,7 +81,7 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
                 # Rule exists — use PATCH to update
                 sys_id = results[0]['sys_id']
                 patch_url = f"{base_url}/{sys_id}"
-                payload = {"u_status": control_status}
+                payload = {"u_status": control_status, "u_resource_detail": resource_detail}
 
                 patch_response = requests.patch(patch_url, auth=(sn_u, sn_p), headers=headers, json=payload)
                 if patch_response.status_code == 200:
@@ -78,7 +93,8 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
                 # Rule does not exist — use POST to create
                 payload = {
                     "u_aws_config_rule_name": rule_name,
-                    "u_status": control_status
+                    "u_status": control_status,
+                    "u_resource_detail": resource_detail,
                 }
                 post_response = requests.post(base_url, auth=(sn_u, sn_p), headers=headers, json=payload)
                 if post_response.status_code in [200, 201]:

@@ -93,7 +93,7 @@ The project also started out generating a PDF and emailing it, which is fine as 
 ### Prerequisites
 - Python 3.10+
 - An AWS account with AWS Config enabled and IAM credentials that can call `config:DescribeComplianceByConfigRule` and `config:GetComplianceDetailsByConfigRule`
-- A ServiceNow instance with a table for tracking AWS Config rule statuses
+- A ServiceNow instance with a table for tracking AWS Config rule statuses, with at minimum three fields: `u_aws_config_rule_name`, `u_status`, and `u_resource_detail` (a string field holding the JSON-serialized list of non-compliant resources for that rule, so an auditor can see *what* failed without leaving ServiceNow - empty when the rule is compliant)
 
 ### 1. Clone and install dependencies
 ```bash
