@@ -38,7 +38,15 @@ def get_all_control_statuses(config_client):
                     for result in res_page['EvaluationResults']:
                         rtype = result['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceType']
                         rid = result['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceId']
-                        resource_list.append({'resource_type': rtype, 'resource_id': rid})
+                        annotation = result.get('Annotation', '')
+                        recorded_time = result.get('ResultRecordedTime')
+                        resource_list.append({
+                            'resource_type': rtype,
+                            'resource_id': rid,
+                            'annotation': annotation,
+                            # ServiceNow's Table API expects "YYYY-MM-DD HH:mm:ss", not ISO 8601
+                            'result_recorded_time': recorded_time.strftime('%Y-%m-%d %H:%M:%S') if recorded_time else '',
+                        })
                 rule_info['resources'] = resource_list
 
             statuses[rule_name] = rule_info
@@ -46,12 +54,16 @@ def get_all_control_statuses(config_client):
     return statuses
 
 def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
-    
+
     base_url = f"https://{sn_i}.service-now.com/api/now/table/{sn_t}"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
+
+    # rule_name -> sys_id, so push_evidence() can link evidence rows back to
+    # the right parent record without re-querying ServiceNow for each one.
+    rule_sys_ids = {}
 
     for rule_name, info in statuses.items():
         control_status = info.get("compliance", "UNKNOWN")
@@ -65,6 +77,7 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
             if results:
                 # Rule exists — use PATCH to update
                 sys_id = results[0]['sys_id']
+                rule_sys_ids[rule_name] = sys_id
                 patch_url = f"{base_url}/{sys_id}"
                 payload = {"u_status": control_status}
 
@@ -82,6 +95,7 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
                 }
                 post_response = requests.post(base_url, auth=(sn_u, sn_p), headers=headers, json=payload)
                 if post_response.status_code in [200, 201]:
+                    rule_sys_ids[rule_name] = post_response.json()["result"]["sys_id"]
                     print(f"Created: {rule_name} - {control_status}")
                 else:
                     print(f"Failed to create {rule_name}. Status: {post_response.status_code}")
@@ -89,3 +103,47 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
         else:
             print(f"Failed to query for {rule_name}. Status: {get_response.status_code}")
             print(get_response.text)
+
+    return rule_sys_ids
+
+
+def push_evidence(sn_i, sn_u, sn_p, statuses, rule_sys_ids):
+    """Insert one evidence row per non-compliant resource per run into
+    u_aws_config_evidence.
+
+    Always a POST, never a PATCH — each run's finding is its own row, so a
+    prior finding is never overwritten. That's what lets an auditor open a
+    control's record in ServiceNow and see the full history of what failed,
+    when, and why, without leaving the platform.
+    """
+    base_url = f"https://{sn_i}.service-now.com/api/now/table/u_aws_config_evidence"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    for rule_name, info in statuses.items():
+        if info.get("compliance") != "NON_COMPLIANT":
+            continue
+
+        sys_id = rule_sys_ids.get(rule_name)
+        if not sys_id:
+            print(f"No sys_id for {rule_name}, skipping evidence push.")
+            continue
+
+        for resource in info.get("resources", []):
+            payload = {
+                "u_control_mapping": sys_id,
+                "u_resource_type": resource.get("resource_type", ""),
+                "u_resource_id": resource.get("resource_id", ""),
+                "u_annotation": resource.get("annotation", ""),
+                "u_compliance_status": "NON_COMPLIANT",
+                "u_captured_at": resource.get("result_recorded_time", ""),
+            }
+
+            response = requests.post(base_url, auth=(sn_u, sn_p), headers=headers, json=payload)
+            if response.status_code in (200, 201):
+                print(f"Evidence recorded: {rule_name} - {resource.get('resource_id')}")
+            else:
+                print(f"Failed to push evidence for {rule_name} - {resource.get('resource_id')}. Status: {response.status_code}")
+                print(response.text)

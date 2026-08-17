@@ -19,7 +19,10 @@ def main():
     statuses = grc_validation.get_all_control_statuses(config_client)
 
     # Update ServiceNow GRC table with statuses from AWS
-    grc_validation.update_service_now(SN_I, SN_T, statuses, SN_U, SN_P)
+    rule_sys_ids = grc_validation.update_service_now(SN_I, SN_T, statuses, SN_U, SN_P)
+
+    # Record per-resource evidence for non-compliant rules
+    grc_validation.push_evidence(SN_I, SN_U, SN_P, statuses, rule_sys_ids)
 
 if __name__ == "__main__":
     main()
