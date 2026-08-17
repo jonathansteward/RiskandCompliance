@@ -89,6 +89,12 @@ def get_remediation_guidance(client, rule_name, rule_definition, evidence):
     return tool_use_block.input
 
 
+def format_remediation_steps(steps):
+    """Join the structured steps list into numbered text for a ServiceNow
+    string field, which has no native concept of a list."""
+    return "\n".join(f"{i}. {step}" for i, step in enumerate(steps, start=1))
+
+
 if __name__ == "__main__":
     # Manual test harness: python agent/remediation.py
     # Pulls one real non-compliant rule from AWS Config and runs it through

@@ -81,9 +81,12 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
         "Accept": "application/json"
     }
 
-    # rule_name -> sys_id, so push_evidence() can link evidence rows back to
-    # the right parent record without re-querying ServiceNow for each one.
-    rule_sys_ids = {}
+    # rule_name -> {sys_id, previous_status}. previous_status is read before
+    # it gets overwritten below, so callers can tell a brand-new failure
+    # (previous_status != NON_COMPLIANT) from one that's still failing from
+    # last run - without this, there'd be no way to know which is which
+    # once the PATCH below has already happened.
+    rule_context = {}
 
     for rule_name, info in statuses.items():
         control_status = info.get("compliance", "UNKNOWN")
@@ -97,7 +100,8 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
             if results:
                 # Rule exists — use PATCH to update
                 sys_id = results[0]['sys_id']
-                rule_sys_ids[rule_name] = sys_id
+                previous_status = results[0].get('u_status')
+                rule_context[rule_name] = {"sys_id": sys_id, "previous_status": previous_status}
                 patch_url = f"{base_url}/{sys_id}"
                 payload = {"u_status": control_status}
 
@@ -115,7 +119,8 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
                 }
                 post_response = requests.post(base_url, auth=(sn_u, sn_p), headers=headers, json=payload)
                 if post_response.status_code in [200, 201]:
-                    rule_sys_ids[rule_name] = post_response.json()["result"]["sys_id"]
+                    sys_id = post_response.json()["result"]["sys_id"]
+                    rule_context[rule_name] = {"sys_id": sys_id, "previous_status": None}
                     print(f"Created: {rule_name} - {control_status}")
                 else:
                     print(f"Failed to create {rule_name}. Status: {post_response.status_code}")
@@ -124,18 +129,54 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
             print(f"Failed to query for {rule_name}. Status: {get_response.status_code}")
             print(get_response.text)
 
-    return rule_sys_ids
+    return rule_context
 
 
-def push_evidence(sn_i, sn_u, sn_p, statuses, rule_sys_ids):
+def get_latest_evidence_guidance(sn_i, sn_u, sn_p, sys_id):
+    """Fetch the most recent evidence row's guidance for a control.
+
+    Used when a rule is still failing the same way it was last run, so the
+    pipeline can carry forward already-generated guidance instead of paying
+    for a fresh Claude call on a finding that hasn't changed.
+    """
+    base_url = f"https://{sn_i}.service-now.com/api/now/table/u_aws_config_evidence"
+    headers = {"Accept": "application/json"}
+    query_url = (
+        f"{base_url}?sysparm_query=u_control_mapping={sys_id}^ORDERBYDESCsys_created_on"
+        f"&sysparm_limit=1"
+    )
+
+    response = requests.get(query_url, auth=(sn_u, sn_p), headers=headers)
+    if response.status_code != 200:
+        return None
+
+    results = response.json().get("result", [])
+    if not results:
+        return None
+
+    row = results[0]
+    if not row.get("u_standard_summary"):
+        return None
+
+    return {
+        "standard_summary": row.get("u_standard_summary", ""),
+        "gap_summary": row.get("u_gap_summary", ""),
+        "remediation_steps_text": row.get("u_remediation_steps", ""),
+    }
+
+
+def push_evidence(sn_i, sn_u, sn_p, statuses, rule_context, guidance_by_rule=None):
     """Insert one evidence row per non-compliant resource per run into
-    u_aws_config_evidence.
+    u_aws_config_evidence, including remediation guidance when available.
 
     Always a POST, never a PATCH — each run's finding is its own row, so a
     prior finding is never overwritten. That's what lets an auditor open a
     control's record in ServiceNow and see the full history of what failed,
-    when, and why, without leaving the platform.
+    when, and why, without leaving the platform. Guidance travels with the
+    evidence itself so ServiceNow-side issue creation can pull it straight
+    from here, rather than Python having to find and patch the issue later.
     """
+    guidance_by_rule = guidance_by_rule or {}
     base_url = f"https://{sn_i}.service-now.com/api/now/table/u_aws_config_evidence"
     headers = {
         "Content-Type": "application/json",
@@ -146,10 +187,12 @@ def push_evidence(sn_i, sn_u, sn_p, statuses, rule_sys_ids):
         if info.get("compliance") != "NON_COMPLIANT":
             continue
 
-        sys_id = rule_sys_ids.get(rule_name)
+        sys_id = rule_context.get(rule_name, {}).get("sys_id")
         if not sys_id:
             print(f"No sys_id for {rule_name}, skipping evidence push.")
             continue
+
+        guidance = guidance_by_rule.get(rule_name, {})
 
         for resource in info.get("resources", []):
             payload = {
@@ -159,6 +202,9 @@ def push_evidence(sn_i, sn_u, sn_p, statuses, rule_sys_ids):
                 "u_annotation": resource.get("annotation", ""),
                 "u_compliance_status": "NON_COMPLIANT",
                 "u_captured_at": resource.get("result_recorded_time", ""),
+                "u_standard_summary": guidance.get("standard_summary", ""),
+                "u_gap_summary": guidance.get("gap_summary", ""),
+                "u_remediation_steps": guidance.get("remediation_steps_text", ""),
             }
 
             response = requests.post(base_url, auth=(sn_u, sn_p), headers=headers, json=payload)
