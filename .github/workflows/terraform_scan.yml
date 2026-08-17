@@ -1,0 +1,111 @@
+name: Terraform Compliance Gate
+
+on:
+  pull_request:
+    paths:
+      - "terraform/examples/**"
+      - "terraform/policy/**"
+
+permissions:
+  contents: read
+
+jobs:
+  detect-changed-examples:
+    runs-on: ubuntu-latest
+    outputs:
+      dirs: ${{ steps.detect.outputs.dirs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect which example directories need scanning
+        id: detect
+        run: |
+          base="origin/${{ github.event.pull_request.base.ref }}"
+          policy_changed=$(git diff --name-only "$base...${{ github.sha }}" -- terraform/policy)
+
+          if [ -n "$policy_changed" ]; then
+            # A policy change can affect every example directory, not just the
+            # ones this PR touches - scan all of them to be safe.
+            dirs=$(find terraform/examples -mindepth 1 -maxdepth 1 -type d | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          else
+            dirs=$(git diff --name-only "$base...${{ github.sha }}" -- terraform/examples \
+              | awk -F/ 'NF>=3 {print $1"/"$2"/"$3}' \
+              | sort -u \
+              | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
+
+          echo "Directories to scan: $dirs"
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+
+  compliance-check:
+    name: Compliance Check
+    needs: detect-changed-examples
+    if: needs.detect-changed-examples.outputs.dirs != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJson(needs.detect-changed-examples.outputs.dirs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Write CI-only provider override
+        working-directory: ${{ matrix.dir }}
+        run: |
+          # This is a policy check against a *plan*, not a real deployment, so
+          # it never needs real AWS credentials. Overriding the provider here
+          # (rather than in the committed main.tf) keeps local plans, which
+          # DO use real credentials, unaffected.
+          cat > override.tf <<'EOF'
+          provider "aws" {
+            region                      = "us-east-2"
+            access_key                  = "mock_access_key"
+            secret_key                  = "mock_secret_key"
+            skip_credentials_validation = true
+            skip_requesting_account_id  = true
+            skip_metadata_api_check     = true
+          }
+          EOF
+
+      - name: Terraform init
+        working-directory: ${{ matrix.dir }}
+        run: terraform init -input=false
+
+      - name: Terraform plan
+        working-directory: ${{ matrix.dir }}
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Convert plan to JSON
+        working-directory: ${{ matrix.dir }}
+        run: terraform show -json tfplan > plan.json
+
+      - name: Install Conftest
+        run: |
+          curl -sSLo conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/download/v0.69.0/conftest_0.69.0_Linux_x86_64.tar.gz
+          tar -xzf conftest.tar.gz conftest
+          chmod +x conftest
+          sudo mv conftest /usr/local/bin/conftest
+
+      - name: Run Conftest
+        working-directory: ${{ matrix.dir }}
+        run: |
+          set -o pipefail
+          conftest test plan.json --policy ../../policy --no-color | tee conftest-output.txt
+          CONFTEST_EXIT=$?
+          {
+            echo "### Compliance check: \`${{ matrix.dir }}\`"
+            echo '```'
+            cat conftest-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $CONFTEST_EXIT

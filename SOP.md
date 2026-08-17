@@ -1,0 +1,55 @@
+# Standard Operating Procedure: RiskandCompliance Pipeline Extension
+
+## Purpose
+
+This document is a running log of the implementation steps taken to extend the RiskandCompliance continuous control monitoring pipeline (see `IMPLEMENTATION_PLAN.md` for the overall plan). It is updated incrementally as work is completed, so the final document reflects exactly what was built, in what order, and why.
+
+## Implementation Log
+
+<!-- Entries added here as work is completed. -->
+
+### 2026-08-17 — Tier 0: dependency and repo hygiene fixes
+- Removed dead code (`generate_report()`, `send_email()`, and their unused imports) from `grc_validation.py` — this closed the `openai` dependency drift (the package was imported but never declared in `requirements.txt`).
+- Added `anthropic`, `numpy`, and `PyYAML` to `requirements.txt` for upcoming tiers (Claude agent, FAIR risk module, control catalog).
+- Moved the stale sample artifact `control_status_report (2).pdf` to `docs/sample-outputs/control_status_report_example.pdf` via `git mv` (preserves history; the old dead code path that generated it no longer exists).
+
+### 2026-08-17 — Local tooling
+- Installed Terraform 1.15.8 as a project-local binary at `bin/terraform` (not a system-wide/Homebrew install), downloaded directly from HashiCorp's release archive for `darwin_arm64`. Added `/bin/`, `.terraform/`, `*.tfstate`, `*.tfstate.backup`, and `crash.log` to `.gitignore`.
+- Installed AWS CLI v2 (2.36.24) via Homebrew (system-level, since AWS credentials/config live in `~/.aws` regardless of where the CLI binary lives, unlike Terraform).
+- Configured AWS CLI `default` profile against the `dev` IAM user; verified with `aws sts get-caller-identity`.
+
+### 2026-08-17 — Tier 2 (partial): Terraform compliant/non-compliant examples
+- Created `terraform/examples/secure-aws/` (`main.tf`, `variables.tf`, `outputs.tf`) — resources that satisfy 6 of the 7 tracked AWS Config rules: `aws_iam_account_password_policy` (strong policy), `aws_cloudtrail` with an S3 data-event selector covering all buckets (`read_write_type = "All"`), `aws_s3_account_public_access_block` (all four blocks enabled), a private `aws_s3_bucket` with public access blocked, and an `aws_subnet` with `map_public_ip_on_launch = false`.
+- Created `terraform/examples/insecure-aws/` with the mirrored non-compliant version of each: weak/no password policy, a CloudTrail trail with no data-event selector (S3 reads unlogged), public access blocks all disabled, S3 buckets with `public-read`/`public-read-write` ACLs, and a subnet with `map_public_ip_on_launch = true`.
+- `root-account-mfa-enabled` (CTRL-001) intentionally has no resource in either directory — it's an account-level root-user setting with no Terraform-manageable equivalent; documented as such in both `main.tf` files and each directory's `control_coverage_note` output.
+- **Known gotcha documented in both `main.tf` files:** `aws_s3_account_public_access_block` is a singleton per AWS account/region — applying both `secure-aws/` and `insecure-aws/` against the same account will conflict (last apply wins, state drift). Not yet resolved; to be addressed before either directory is actually `terraform apply`'d (currently neither has been — files were created but not planned/applied against real AWS).
+- Bucket-name variables (`cloudtrail_bucket_name`, `example_bucket_name`, `public_read_bucket_name`, `public_write_bucket_name`) have no defaults, requiring real globally-unique values via `terraform.tfvars` or `-var` before `terraform plan`/`apply` will run — a deliberate guard against accidental apply with placeholder names.
+
+### 2026-08-17 — Tier 2 (partial): Conftest/Rego policies
+- Created `terraform/policy/` with one `.rego` file per control (all under `package main` so `conftest test` picks them all up with no extra namespace flags), evaluated against `terraform show -json` plan output rather than raw `.tf` — thresholds mirror AWS Config's actual managed-rule defaults where applicable:
+  - `ctrl_002_iam_password_policy.rego` — 8 granular `deny` rules against `aws_iam_account_password_policy` (min length 14, all 4 complexity classes, max age ≤ 90 and > 0, reuse prevention ≥ 24), each reporting the specific failing requirement rather than one generic failure.
+  - `ctrl_003_cloudtrail_s3_data_events.rego` — `aws_cloudtrail` must have an `event_selector` with `read_write_type` of `All`/`ReadOnly` covering an `AWS::S3::Object` data resource, or it's flagged.
+  - `ctrl_004_s3_account_public_access_block.rego` — all four `aws_s3_account_public_access_block` settings must be `true`.
+  - `ctrl_005_006_s3_bucket_public_access.rego` — covers both controls: bucket-level `aws_s3_bucket_public_access_block` failures are tagged `[CTRL-005][CTRL-006]` together (the block settings aren't separable into read vs. write), while `aws_s3_bucket_acl` values are split — `public-read`/`authenticated-read`/`public-read-write` trip CTRL-005, `public-read-write` alone also trips CTRL-006.
+  - `ctrl_007_subnet_public_ip.rego` — `aws_subnet.map_public_ip_on_launch` must be `false`.
+- `root-account-mfa-enabled` (CTRL-001) has no corresponding policy file — consistent with it having no Terraform resource at all (see prior entry); it stays enforced only by the runtime AWS Config pipeline, not this IaC gate.
+- Every `deny` message is prefixed with its control ID tag (e.g. `[CTRL-005]`) so a future PR-bot step can regex-extract it and join back to `controls/control_catalog.yaml` — matches the plan's approach of Conftest owning its rules as source of truth rather than mapping an external vendor ID.
+- Not yet done: `controls/control_catalog.yaml` itself hasn't been created (an earlier attempt was deferred), Conftest isn't installed yet, and these policies haven't been test-run against a real `terraform plan` for either example directory — written but unverified.
+
+### 2026-08-17 — Evidence directory
+- Created `evidence/` at the repo root to hold `terraform show -json` plan output generated during the CI/CD compliance gate, ahead of Conftest evaluation. Decision: these plan JSON files are intended to be **git-committed, not gitignored** — treated as audit evidence of what was scanned and when, consistent with the "evidence, not just pass/fail" principle already used on the AWS Config/ServiceNow side. Added a `README.md` inside the directory (also serves as the placeholder so git tracks the otherwise-empty folder) documenting this, and noting it will also hold `history.jsonl` once Tier 1 (evidence history/drift detection) is built.
+
+### 2026-08-17 — Tier 2 verification: end-to-end Conftest run against real plans
+- Installed Conftest 0.69.0 (OPA 1.19.0) as a local project binary at `bin/conftest`, same pattern as Terraform — downloaded directly from the GitHub release for `Darwin_arm64`.
+- Ran `terraform init` + `terraform plan` (using the `dev` IAM user's credentials, plan-only, nothing applied) in both `terraform/examples/secure-aws/` and `terraform/examples/insecure-aws/`, supplying the required bucket-name variables via `-var`. Converted each plan to JSON with `terraform show -json` and saved as `evidence/plan_compliant.json` and `evidence/plan_noncompliant.json`.
+- Ran `conftest test <plan>.json --policy terraform/policy` against both:
+  - **Compliant plan: 14/14 tests passed, 0 failures.**
+  - **Non-compliant plan: 0/15 passed, 15 failures** — every deliberately-broken resource was caught, one or more failures per control (CTRL-002 through CTRL-007), each message correctly tagged with its control ID. Confirms the Rego policies written earlier actually work against real Terraform plan JSON, not just in theory.
+- Cleanup: deleted the binary `tfplan` files in both example directories (already converted to JSON, no longer needed) and added `tfplan` to `.gitignore` so future binary plan files aren't accidentally committed. `.terraform/` provider cache directories were already covered by the existing `.terraform/` gitignore pattern. `.terraform.lock.hcl` in both directories is intentionally left tracked (standard practice — pins the exact `hashicorp/aws` provider version, v5.100.0, for reproducible plans).
+
+### 2026-08-17 — Tier 2/3: CI/CD compliance gate workflow
+- Created `.github/workflows/terraform_scan.yml`, triggered on `pull_request` for paths `terraform/examples/**` and `terraform/policy/**`. Two jobs:
+  - `detect-changed-examples`: diffs the PR against its base ref to find which `terraform/examples/<dir>` directories actually changed, so the gate only scans what the PR touches — not every example directory on every PR (which would make a compliant-only PR fail forever, since the deliberately-broken `insecure-aws/` example permanently lives in the repo). If the diff touches `terraform/policy/` instead, all example directories are scanned, since a policy change can affect every directory, not just one.
+  - `compliance-check`: matrix job, one run per changed directory. Writes a CI-only `override.tf` with mock AWS credentials (`skip_credentials_validation`, `skip_requesting_account_id`) before `terraform init`/`plan` — deliberately never uses real AWS credentials, since every resource in both example directories is a fresh `create` with no data source that needs a live AWS API response, so a policy check never needs real cloud access. This override is generated at CI runtime only, not committed, so local plans (which do use real `dev` IAM credentials) are unaffected. Runs `terraform show -json` → installs Conftest 0.69.0 (Linux x86_64, matching `ubuntu-latest`) → `conftest test` against `terraform/policy/` → writes results to the GitHub Actions job summary (`$GITHUB_STEP_SUMMARY`) → exits with Conftest's real exit code (via `set -o pipefail`, since piping through `tee` would otherwise mask a failing exit code) so the check genuinely fails the PR, not just logs a warning.
+- **Bug caught before the first real run:** the bucket-name variables in both example directories have no defaults (a deliberate guard against accidental local apply), which would make `terraform plan -input=false` fail outright in CI with no value supplied. Fixed by adding `ci.auto.tfvars` to each example directory with placeholder bucket names — Terraform auto-loads these, and an explicit `-var` flag (as used for local testing) still takes precedence over them, so this doesn't change any prior local behavior.
+- Not yet done at time of writing: branch protection on `main` requiring this check hasn't been configured yet — exact required-check context names are being confirmed from a first real run before adding them, since GitHub's required-status-check API needs the literal context string (`Compliance Check (terraform/examples/...)` for a matrix job).

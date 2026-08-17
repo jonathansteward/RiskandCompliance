@@ -2,3 +2,9 @@
 /reports/
 /__pycache__/
 .DS_Store
+/bin/
+.terraform/
+*.tfstate
+*.tfstate.backup
+crash.log
+tfplan
