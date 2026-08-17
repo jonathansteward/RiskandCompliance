@@ -1,3 +1,5 @@
+import json
+
 import requests
 from requests.auth import HTTPBasicAuth
 
@@ -52,6 +54,24 @@ def get_all_control_statuses(config_client):
             statuses[rule_name] = rule_info
 
     return statuses
+
+def get_rule_definition(config_client, rule_name):
+    """Fetch AWS Config's own description and configured thresholds for a
+    rule - the authoritative "what standard is this enforcing" source, so
+    nothing about the control's policy gets duplicated/hardcoded elsewhere.
+    """
+    response = config_client.describe_config_rules(ConfigRuleNames=[rule_name])
+    rule = response['ConfigRules'][0]
+
+    raw_parameters = rule.get('InputParameters', '{}')
+    input_parameters = json.loads(raw_parameters) if raw_parameters else {}
+
+    return {
+        'description': rule.get('Description', ''),
+        'source_identifier': rule.get('Source', {}).get('SourceIdentifier', ''),
+        'input_parameters': input_parameters,
+    }
+
 
 def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
 
