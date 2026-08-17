@@ -120,6 +120,16 @@ AWS_SECRET_ACCESS_KEY=<your-secret-access-key>
 AWS_DEFAULT_REGION=<your-aws-region>
 ```
 
+For Slack/email drift alerts (`notifications/notify.py`):
+```
+SLACK_WEBHOOK_URL=<incoming webhook URL from a Slack app>
+EMAIL_FROM=<sender address>
+EMAIL_TO=<recipient address>
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+EMAIL_APP_PASSWORD=<app-specific password, not your regular account password>
+```
+
 ### 3. Run locally
 ```bash
 python main.py
