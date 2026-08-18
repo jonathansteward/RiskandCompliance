@@ -140,7 +140,7 @@ def get_change_history(sn_i, sn_u, sn_p, days=90):
                 label_by_sys_id[risk_sys_id] = f"{rule_name} ({control['name']})"
 
     if not label_by_sys_id:
-        return []
+        return {}
 
     query = (
         f"documentkeyIN{','.join(label_by_sys_id.keys())}"
@@ -154,27 +154,43 @@ def get_change_history(sn_i, sn_u, sn_p, days=90):
         auth=(sn_u, sn_p), headers=headers,
     )
 
-    history = []
-    for entry in response.json().get("result", []):
-        is_exposure = entry.get("fieldname") == "inherent_ale"
-        new_value = entry.get("newvalue") or ""
-        old_value = entry.get("oldvalue") or "(new)"
-        if is_exposure:
-            try:
-                new_value = f"${float(new_value):,.0f}"
-                old_value = f"${float(old_value):,.0f}" if old_value != "(new)" else old_value
-            except ValueError:
-                pass
+    def _format_exposure(value):
+        if not value:
+            return "(new)"
+        try:
+            return f"${float(value):,.0f}"
+        except ValueError:
+            return value
 
-        history.append({
+    # Merge the rating change and the exposure change from the same update
+    # into one row - they come from the same PATCH, so sys_created_on
+    # matches to the second, and showing them as two disconnected rows
+    # (as the first version of this did) makes a single event look like
+    # two unrelated ones.
+    moments = {}
+    for entry in response.json().get("result", []):
+        key = (entry.get("documentkey"), entry.get("sys_created_on"))
+        moment = moments.setdefault(key, {
             "date": (entry.get("sys_created_on") or "")[:10],
             "control_label": label_by_sys_id.get(entry.get("documentkey"), "(unknown)"),
-            "field": "Annual Exposure" if is_exposure else "Rating",
-            "old_value": old_value,
-            "new_value": new_value,
+            "rating": None,
+            "exposure": None,
+            "sort_key": entry.get("sys_created_on") or "",
         })
+        if entry.get("fieldname") == "u_risk_rating":
+            moment["rating"] = (entry.get("oldvalue") or "(new)", entry.get("newvalue") or "")
+        else:
+            moment["exposure"] = (_format_exposure(entry.get("oldvalue")), _format_exposure(entry.get("newvalue")))
 
-    return history
+    # Group by control so each control's own story reads as one sequence,
+    # rather than interleaving every control's changes into one timeline.
+    by_control = {}
+    for moment in moments.values():
+        by_control.setdefault(moment["control_label"], []).append(moment)
+    for control_moments in by_control.values():
+        control_moments.sort(key=lambda m: m["sort_key"])
+
+    return by_control
 
 
 def generate_executive_summary(claude_client, changed, unchanged):
@@ -399,33 +415,45 @@ def build_pdf_report(changed, unchanged, history=None, executive_summary=None, o
     if not history:
         elements.append(Paragraph("No change history recorded yet.", normal))
     else:
-        trend_widths = [
-            content_width * 0.12,  # Date
-            content_width * 0.34,  # Control
-            content_width * 0.16,  # Field
-            content_width * 0.38,  # Old -> New
-        ]
-        header = [Paragraph(h, header_cell) for h in ["Date", "Control", "Field", "Change"]]
-        data = [header]
-        for entry in history:
-            data.append([
-                Paragraph(entry["date"], cell),
-                Paragraph(entry["control_label"], cell),
-                Paragraph(entry["field"], cell),
-                Paragraph(f"{entry['old_value']} &rarr; {entry['new_value']}", cell),
-            ])
+        control_style = ParagraphStyle(
+            "control_name", parent=normal, fontSize=10, fontName="Helvetica-Bold",
+        )
+        trend_widths = [content_width * 0.15, content_width * 0.425, content_width * 0.425]
 
-        trend_table = Table(data, colWidths=trend_widths, repeatRows=1)
-        trend_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ("LEFTPADDING", (0, 0), (-1, -1), 8),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f9fafb")]),
-        ]))
-        elements.append(trend_table)
+        for control_label, moments in history.items():
+            elements.append(Paragraph(control_label, control_style))
+            elements.append(Spacer(1, 0.06 * inch))
+
+            header = [Paragraph(h, header_cell) for h in ["Date", "Rating", "Annual Exposure"]]
+            data = [header]
+            for moment in moments:
+                rating_text = "&mdash;"
+                if moment["rating"]:
+                    old, new = moment["rating"]
+                    rating_text = f"{old} &rarr; {new}"
+                exposure_text = "&mdash;"
+                if moment["exposure"]:
+                    old, new = moment["exposure"]
+                    exposure_text = f"{old} &rarr; {new}"
+
+                data.append([
+                    Paragraph(moment["date"], cell),
+                    Paragraph(rating_text, cell),
+                    Paragraph(exposure_text, cell),
+                ])
+
+            trend_table = Table(data, colWidths=trend_widths, repeatRows=1)
+            trend_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f9fafb")]),
+            ]))
+            elements.append(trend_table)
+            elements.append(Spacer(1, 0.25 * inch))
 
     doc.build(elements, onFirstPage=_footer, onLaterPages=_footer)
     return output_path
