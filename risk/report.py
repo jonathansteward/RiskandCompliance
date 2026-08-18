@@ -106,6 +106,73 @@ def get_changes_since_last_run(sn_i, sn_u, sn_p, elevated_risks, hours=24):
     return changed, unchanged
 
 
+def _get_risk_record_sys_id(sn_i, sn_u, sn_p, control_sys_id):
+    url = f"https://{sn_i}.service-now.com/api/now/table/sn_risk_risk"
+    headers = {"Accept": "application/json"}
+    response = requests.get(
+        f"{url}?sysparm_query=u_compliance_control={control_sys_id}&sysparm_limit=1&sysparm_fields=sys_id",
+        auth=(sn_u, sn_p), headers=headers,
+    )
+    results = response.json().get("result", [])
+    return results[0]["sys_id"] if results else None
+
+
+def get_change_history(sn_i, sn_u, sn_p, days=90):
+    """Full rating/exposure change history across every tracked control,
+    not just today's window - the trend view. Deliberately thin right now
+    since sys_audit was only enabled today; fills in naturally as the
+    pipeline runs daily going forward, rather than fabricating history
+    that doesn't exist yet.
+    """
+    headers = {"Accept": "application/json"}
+    audit_url = f"https://{sn_i}.service-now.com/api/now/table/sys_audit"
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    label_by_sys_id = {}
+    for rule_name, controls in RULE_CONTROLS.items():
+        for control in controls:
+            risk_sys_id = _get_risk_record_sys_id(sn_i, sn_u, sn_p, control["sys_id"])
+            if risk_sys_id:
+                label_by_sys_id[risk_sys_id] = f"{rule_name} ({control['name']})"
+
+    if not label_by_sys_id:
+        return []
+
+    query = (
+        f"documentkeyIN{','.join(label_by_sys_id.keys())}"
+        f"^fieldnameINu_risk_rating,inherent_ale"
+        f"^sys_created_on>={cutoff}"
+        f"^ORDERBYsys_created_on"
+    )
+    response = requests.get(
+        f"{audit_url}?sysparm_query={query}"
+        f"&sysparm_fields=documentkey,fieldname,oldvalue,newvalue,sys_created_on",
+        auth=(sn_u, sn_p), headers=headers,
+    )
+
+    history = []
+    for entry in response.json().get("result", []):
+        is_exposure = entry.get("fieldname") == "inherent_ale"
+        new_value = entry.get("newvalue") or ""
+        old_value = entry.get("oldvalue") or "(new)"
+        if is_exposure:
+            try:
+                new_value = f"${float(new_value):,.0f}"
+                old_value = f"${float(old_value):,.0f}" if old_value != "(new)" else old_value
+            except ValueError:
+                pass
+
+        history.append({
+            "date": (entry.get("sys_created_on") or "")[:10],
+            "control_label": label_by_sys_id.get(entry.get("documentkey"), "(unknown)"),
+            "field": "Annual Exposure" if is_exposure else "Rating",
+            "old_value": old_value,
+            "new_value": new_value,
+        })
+
+    return history
+
+
 _PAGE_SIZE = landscape(letter)
 _MARGIN = 0.6 * inch
 _RATING_COLORS = {"High": colors.HexColor("#b91c1c"), "Medium High": colors.HexColor("#c2410c")}
@@ -126,7 +193,7 @@ def _footer(canvas, doc):
     canvas.restoreState()
 
 
-def build_pdf_report(changed, unchanged, output_path=REPORT_PATH):
+def build_pdf_report(changed, unchanged, history=None, output_path=REPORT_PATH):
     """Render the structured PDF: a colored header band, a summary line,
     then one table each for what changed since the last run and what's
     persisting - every cell wrapped in a Paragraph so long content wraps
@@ -241,6 +308,50 @@ def build_pdf_report(changed, unchanged, output_path=REPORT_PATH):
     section("New / Changed Since Last Run", changed, "No rating changes since the last run.")
     section("Persisting Risks (Unchanged)", unchanged, "No unchanged elevated risks.")
 
+    # Trend section: every recorded change across all tracked controls, not
+    # just today's window. Deliberately thin right now - change history was
+    # only enabled today - and fills in naturally as the pipeline runs.
+    elements.append(Paragraph("Change History (Trend)", styles["Heading2"]))
+    elements.append(Spacer(1, 0.05 * inch))
+    elements.append(Paragraph(
+        "Every recorded rating/exposure change across all tracked controls, oldest first. "
+        "Native change tracking was enabled for this report; expect this section to grow "
+        "day over day rather than show meaningful trends from a single day's data.",
+        disclaimer_style,
+    ))
+    elements.append(Spacer(1, 0.1 * inch))
+
+    if not history:
+        elements.append(Paragraph("No change history recorded yet.", normal))
+    else:
+        trend_widths = [
+            content_width * 0.12,  # Date
+            content_width * 0.34,  # Control
+            content_width * 0.16,  # Field
+            content_width * 0.38,  # Old -> New
+        ]
+        header = [Paragraph(h, header_cell) for h in ["Date", "Control", "Field", "Change"]]
+        data = [header]
+        for entry in history:
+            data.append([
+                Paragraph(entry["date"], cell),
+                Paragraph(entry["control_label"], cell),
+                Paragraph(entry["field"], cell),
+                Paragraph(f"{entry['old_value']} &rarr; {entry['new_value']}", cell),
+            ])
+
+        trend_table = Table(data, colWidths=trend_widths, repeatRows=1)
+        trend_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f9fafb")]),
+        ]))
+        elements.append(trend_table)
+
     doc.build(elements, onFirstPage=_footer, onLaterPages=_footer)
     return output_path
 
@@ -259,7 +370,8 @@ def send_daily_report(sn_i, sn_u, sn_p, sn_t, webhook_url, from_email, to_email,
         return
 
     changed, unchanged = get_changes_since_last_run(sn_i, sn_u, sn_p, elevated)
-    build_pdf_report(changed, unchanged, REPORT_PATH)
+    history = get_change_history(sn_i, sn_u, sn_p)
+    build_pdf_report(changed, unchanged, history, REPORT_PATH)
 
     if webhook_url:
         send_risk_digest_slack(webhook_url, changed, unchanged)
