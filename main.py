@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 
 import agent.remediation as remediation
 import grc_validation
+from risk.fair_model import RULE_CONTROLS, sync_risk_for_rule
+from risk.report import send_daily_report
 
 
 def main():
@@ -65,6 +67,27 @@ def main():
 
     # Record per-resource evidence for non-compliant rules, including guidance
     grc_validation.push_evidence(SN_I, SN_U, SN_P, statuses, rule_context, guidance_by_rule)
+
+    # Sync risk assessments for every rule with a mapped control: push a
+    # fresh assessment when currently non-compliant, or mark existing
+    # records inactive (without recomputing) when they aren't.
+    for rule_name in RULE_CONTROLS:
+        is_non_compliant = statuses.get(rule_name, {}).get("compliance") == "NON_COMPLIANT"
+        sync_risk_for_rule(SN_I, SN_U, SN_P, rule_name, is_non_compliant)
+
+    # Daily elevated-risk report (Medium High/High only) - pulls fresh from
+    # ServiceNow rather than reusing in-memory state, so it reflects what
+    # was actually written above, and no-ops cleanly if nothing qualifies.
+    send_daily_report(
+        sn_i=SN_I, sn_u=SN_U, sn_p=SN_P, sn_t=SN_T,
+        webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
+        from_email=os.getenv("EMAIL_FROM"),
+        to_email=os.getenv("EMAIL_TO"),
+        owner_email="priya.natarajan@example.com",
+        smtp_server=os.getenv("SMTP_SERVER"),
+        smtp_port=os.getenv("SMTP_PORT"),
+        app_password=os.getenv("EMAIL_APP_PASSWORD"),
+    )
 
 
 if __name__ == "__main__":

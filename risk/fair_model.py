@@ -12,6 +12,8 @@ from statistics import mean as _mean
 
 import requests
 
+import grc_validation
+
 # (min, likely, max) triangular-distribution inputs per rule. Illustrative -
 # reasoned from published industry breach-cost benchmarks (e.g. IBM Cost of
 # a Data Breach), not this org's own incident history. State that plainly
@@ -19,18 +21,18 @@ import requests
 RISK_INPUTS = {
     "root-account-mfa-enabled": {
         "contact_frequency": (0.5, 1, 3),          # targeted root-credential attack attempts/year
-        "probability_of_action": (0.5, 0.7, 0.9),  # high - a compromised root credential is high-value
-        "loss_magnitude": (100_000, 500_000, 2_000_000),  # full account takeover
+        "probability_of_action": (0.6, 0.85, 0.95),  # high - a compromised root credential is high-value
+        "loss_magnitude": (300_000, 1_000_000, 3_000_000),  # full account takeover - the most catastrophic control in scope
     },
     "iam-password-policy": {
-        "contact_frequency": (2, 5, 12),           # credential-stuffing/brute-force attempts/year
-        "probability_of_action": (0.3, 0.5, 0.7),
-        "loss_magnitude": (20_000, 75_000, 250_000),  # single IAM user compromise
+        "contact_frequency": (2, 8, 15),           # credential-stuffing/brute-force attempts/year - common, low-effort
+        "probability_of_action": (0.3, 0.6, 0.8),
+        "loss_magnitude": (20_000, 150_000, 300_000),  # single IAM user compromise, compounding with weak policy
     },
     "cloudtrail-all-read-s3-data-event-check": {
         "contact_frequency": (0.5, 2, 5),          # attempted S3 data-object reads/year
-        "probability_of_action": (0.2, 0.4, 0.6),
-        "loss_magnitude": (50_000, 200_000, 600_000),  # amplified by lack of detection/response visibility
+        "probability_of_action": (0.2, 0.5, 0.7),
+        "loss_magnitude": (80_000, 650_000, 1_200_000),  # amplified by lack of detection/response visibility
     },
 }
 
@@ -75,6 +77,16 @@ RULE_CONTROLS = {
             "statement": "eff33b4d83f20b1085a5c310feaad3dc",
         },
     ],
+}
+
+# rule_name -> sys_id of its row in u_aws_config_control_mapping - needed to
+# look up that control's latest evidence (evidence links to this row, not
+# directly to sn_compliance_control), so the risk record can carry the
+# current gap without a report-time join across three tables.
+RULE_MAPPING_SYS_IDS = {
+    "root-account-mfa-enabled": "c793da3c83be071085a5c310feaad357",
+    "iam-password-policy": "2a58123883fe071085a5c310feaad3b0",
+    "cloudtrail-all-read-s3-data-event-check": "6058def483fe071085a5c310feaad33f",
 }
 
 # The "AWS" entity/asset in ServiceNow's GRC data model (sn_grc_profile) -
@@ -206,16 +218,31 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id, control
         print(get_response.text)
         return None
 
+    description = assessment["description"]
+    mapping_sys_id = RULE_MAPPING_SYS_IDS.get(rule_name)
+    if mapping_sys_id:
+        # Denormalize the latest evidence gap onto the risk record itself,
+        # rather than joining u_aws_config_evidence in at report time -
+        # that table is one row per resource per run by design, so a join
+        # would multiply this control into as many rows as it has
+        # accumulated history instead of showing one row per control.
+        latest = grc_validation.get_latest_evidence_guidance(sn_i, sn_u, sn_p, mapping_sys_id)
+        if latest and latest.get("gap_summary"):
+            description += f"\n\nCurrent gap: {latest['gap_summary']}"
+
     payload = {
         "u_compliance_control": control_sys_id,
         "profile": AWS_ENTITY_PROFILE_SYS_ID,
         "name": f"AWS Config: {label} - inherent risk",
-        "description": assessment["description"],
+        "description": description,
         "inherent_sle": assessment["inherent_sle"],
         "inherent_aro": assessment["inherent_aro"],
         "inherent_ale": assessment["inherent_ale"],
         "u_risk_rating": assessment["rating"],
         "u_risk_owner_email": RISK_OWNER_EMAIL,
+        # Currently non-compliant, so this record is a live/current risk -
+        # see set_risk_active() for the counterpart that flips this off.
+        "active": "true",
     }
     if statement_sys_id:
         payload["statement"] = statement_sys_id
@@ -255,6 +282,57 @@ def push_risk_for_rule(sn_i, sn_u, sn_p, rule_name):
         push_risk_to_servicenow(
             sn_i, sn_u, sn_p, rule_name, control["sys_id"], control["name"], control["statement"]
         )
+        for control in controls
+    ]
+
+
+def set_risk_active(sn_i, sn_u, sn_p, control_sys_id, active):
+    """Flip a control's existing risk record active/inactive without
+    recomputing the assessment - used when a control's compliance status
+    means its risk record shouldn't be treated as current anymore (e.g. the
+    control is compliant again), where a fresh Monte Carlo run would be
+    wasted work.
+    """
+    base_url = f"https://{sn_i}.service-now.com/api/now/table/sn_risk_risk"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    query_url = f"{base_url}?sysparm_query=u_compliance_control={control_sys_id}&sysparm_limit=1"
+    get_response = requests.get(query_url, auth=(sn_u, sn_p), headers=headers)
+    if get_response.status_code != 200:
+        print(f"Failed to query sn_risk_risk for {control_sys_id}. Status: {get_response.status_code}")
+        return None
+
+    results = get_response.json().get("result", [])
+    if not results:
+        return None  # no existing risk record for this control - nothing to flip
+
+    sys_id = results[0]["sys_id"]
+    response = requests.patch(
+        f"{base_url}/{sys_id}", auth=(sn_u, sn_p), headers=headers,
+        json={"active": "true" if active else "false"},
+    )
+    if response.status_code == 200:
+        print(f"Set active={active} on risk record for control {control_sys_id}")
+        return response.json()["result"]
+    else:
+        print(f"Failed to set active on risk record for {control_sys_id}. Status: {response.status_code}")
+        return None
+
+
+def sync_risk_for_rule(sn_i, sn_u, sn_p, rule_name, is_non_compliant):
+    """Daily entry point: push a fresh assessment (active=true) when the
+    rule is currently non-compliant, or mark its existing risk record(s)
+    inactive - without recomputing - when it isn't.
+    """
+    controls = RULE_CONTROLS.get(rule_name, [])
+    if not controls:
+        return []
+
+    if is_non_compliant:
+        return push_risk_for_rule(sn_i, sn_u, sn_p, rule_name)
+
+    return [
+        set_risk_active(sn_i, sn_u, sn_p, control["sys_id"], active=False)
         for control in controls
     ]
 
