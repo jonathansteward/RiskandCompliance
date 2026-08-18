@@ -88,6 +88,7 @@ def main():
         smtp_server=os.getenv("SMTP_SERVER"),
         smtp_port=os.getenv("SMTP_PORT"),
         app_password=os.getenv("EMAIL_APP_PASSWORD"),
+        claude_client=claude_client,
     )
 
 

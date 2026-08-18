@@ -70,6 +70,10 @@ def get_elevated_risks(sn_i, sn_u, sn_p, sn_t):
                 "number": record.get("number"),
                 "sys_id": record.get("sys_id"),
                 "link": _servicenow_link(sn_i, record.get("sys_id")),
+                # Carries the risk narrative + the denormalized "Current
+                # gap" text (see push_risk_to_servicenow) - the actual
+                # substance an executive summary needs, not just numbers.
+                "description": record.get("description", ""),
             })
 
     return elevated
@@ -173,6 +177,68 @@ def get_change_history(sn_i, sn_u, sn_p, days=90):
     return history
 
 
+def generate_executive_summary(claude_client, changed, unchanged):
+    """Ask Claude to synthesize today's elevated-risk picture into a short
+    executive summary grounded in each finding's actual evidence gap, not
+    just a table of numbers.
+
+    Single forced tool call, same structured-output pattern as
+    agent/remediation.py - every input is already assembled (rating,
+    exposure, the denormalized gap text), so there's no case-by-case
+    decision an autonomous multi-step agent would be making here either.
+    Returns None if there's nothing to summarize or no Claude client.
+    """
+    if not claude_client or (not changed and not unchanged):
+        return None
+
+    findings_text = []
+    for risk in changed + unchanged:
+        status = "NEW/CHANGED" if "previous_rating" in risk else "PERSISTING"
+        findings_text.append(
+            f"[{status}] {risk['rule_name']} ({risk['control_name']}) - "
+            f"{risk['rating']}, ${risk['inherent_ale']:,.0f}/yr\n{risk.get('description', '')}"
+        )
+
+    prompt = (
+        "You are drafting the executive summary for a daily risk report going to a risk "
+        "owner and engineering leadership. Given the elevated (Medium High/High) findings "
+        "below, write a 3-5 sentence summary of what's driving today's elevated risk "
+        "picture and why it matters. Be specific about the actual gaps described - do not "
+        "invent facts not present in the findings, and do not just restate the numbers.\n\n"
+        + "\n\n".join(findings_text)
+    )
+
+    tool = {
+        "name": "submit_executive_summary",
+        "description": "Submit the executive summary for the daily risk report.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "3-5 sentence executive summary, specific to the findings given.",
+                },
+            },
+            "required": ["summary"],
+        },
+    }
+
+    response = claude_client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=512,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "submit_executive_summary"},
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    if response.stop_reason == "max_tokens":
+        print("Executive summary generation was cut off (max_tokens) - skipping.")
+        return None
+
+    tool_use_block = next(block for block in response.content if block.type == "tool_use")
+    return tool_use_block.input["summary"]
+
+
 _PAGE_SIZE = landscape(letter)
 _MARGIN = 0.6 * inch
 _RATING_COLORS = {"High": colors.HexColor("#b91c1c"), "Medium High": colors.HexColor("#c2410c")}
@@ -193,7 +259,7 @@ def _footer(canvas, doc):
     canvas.restoreState()
 
 
-def build_pdf_report(changed, unchanged, history=None, output_path=REPORT_PATH):
+def build_pdf_report(changed, unchanged, history=None, executive_summary=None, output_path=REPORT_PATH):
     """Render the structured PDF: a colored header band, a summary line,
     then one table each for what changed since the last run and what's
     persisting - every cell wrapped in a Paragraph so long content wraps
@@ -214,6 +280,9 @@ def build_pdf_report(changed, unchanged, history=None, output_path=REPORT_PATH):
     )
     disclaimer_style = ParagraphStyle(
         "disclaimer", parent=normal, textColor=colors.HexColor("#6b7280"), fontSize=8, leading=11
+    )
+    summary_body_style = ParagraphStyle(
+        "summary_body", parent=normal, fontSize=10.5, leading=15
     )
 
     doc = SimpleDocTemplate(
@@ -256,6 +325,12 @@ def build_pdf_report(changed, unchanged, history=None, output_path=REPORT_PATH):
         ),
         Spacer(1, 0.3 * inch),
     ]
+
+    if executive_summary:
+        elements.append(Paragraph("Executive Summary", styles["Heading2"]))
+        elements.append(Spacer(1, 0.08 * inch))
+        elements.append(Paragraph(executive_summary, summary_body_style))
+        elements.append(Spacer(1, 0.35 * inch))
 
     col_widths = [
         content_width * 0.27,  # Control
@@ -357,9 +432,11 @@ def build_pdf_report(changed, unchanged, history=None, output_path=REPORT_PATH):
 
 
 def send_daily_report(sn_i, sn_u, sn_p, sn_t, slack_bot_token, slack_channel_id,
-                       from_email, to_email, owner_email, smtp_server, smtp_port, app_password):
+                       from_email, to_email, owner_email, smtp_server, smtp_port, app_password,
+                       claude_client=None):
     """Full daily pipeline: pull elevated risks from ServiceNow, diff
-    against audit history, build the PDF, and deliver via Slack + email -
+    against audit history, build the PDF (with a Claude-written executive
+    summary when a client is provided), and deliver via Slack + email -
     both just the PDF itself, no text digest in either channel.
     No-ops cleanly if there's nothing Medium High/High to report.
     """
@@ -372,7 +449,8 @@ def send_daily_report(sn_i, sn_u, sn_p, sn_t, slack_bot_token, slack_channel_id,
 
     changed, unchanged = get_changes_since_last_run(sn_i, sn_u, sn_p, elevated)
     history = get_change_history(sn_i, sn_u, sn_p)
-    build_pdf_report(changed, unchanged, history, REPORT_PATH)
+    executive_summary = generate_executive_summary(claude_client, changed, unchanged)
+    build_pdf_report(changed, unchanged, history, executive_summary, REPORT_PATH)
 
     if slack_bot_token and slack_channel_id:
         send_risk_report_slack_file(slack_bot_token, slack_channel_id, REPORT_PATH)
@@ -386,9 +464,13 @@ def send_daily_report(sn_i, sn_u, sn_p, sn_t, slack_bot_token, slack_channel_id,
 
 if __name__ == "__main__":
     # Manual test harness: python -m risk.report
+    import anthropic
     from dotenv import load_dotenv
 
     load_dotenv()
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    claude_client = anthropic.Anthropic(api_key=api_key) if api_key else None
 
     send_daily_report(
         sn_i=os.getenv("SN_I"),
@@ -403,4 +485,5 @@ if __name__ == "__main__":
         smtp_server=os.getenv("SMTP_SERVER"),
         smtp_port=os.getenv("SMTP_PORT"),
         app_password=os.getenv("EMAIL_APP_PASSWORD"),
+        claude_client=claude_client,
     )
