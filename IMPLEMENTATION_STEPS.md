@@ -1,4 +1,4 @@
-# Standard Operating Procedure: RiskandCompliance Pipeline Extension
+# Implementation Steps: RiskandCompliance Pipeline Extension
 
 ## Purpose
 
