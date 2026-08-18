@@ -148,10 +148,10 @@ def send_risk_digest_slack(webhook_url, changed, unchanged):
         print("Risk digest Slack alert sent.")
 
 
-def send_risk_report_email(from_email, to_emails, smtp_server, smtp_port, app_password, pdf_path, summary_text):
+def send_risk_report_email(from_email, to_emails, smtp_server, smtp_port, app_password, pdf_path):
     """Email the daily elevated-risk report to multiple recipients (risk
-    owner + engineering team responsible for fixing the resource), with the
-    structured PDF attached and a plain-text summary in the body.
+    owner + engineering team responsible for fixing the resource) - just
+    the PDF attached, no summary text in the body.
 
     to_emails: list of recipient addresses.
     """
@@ -159,7 +159,6 @@ def send_risk_report_email(from_email, to_emails, smtp_server, smtp_port, app_pa
     message["From"] = from_email
     message["To"] = ", ".join(to_emails)
     message["Subject"] = "Daily Risk Report: Elevated Findings"
-    message.attach(MIMEText(summary_text, "plain"))
 
     with open(pdf_path, "rb") as f:
         attachment = MIMEApplication(f.read(), _subtype="pdf")

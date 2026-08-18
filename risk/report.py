@@ -377,10 +377,9 @@ def send_daily_report(sn_i, sn_u, sn_p, sn_t, webhook_url, from_email, to_email,
         send_risk_digest_slack(webhook_url, changed, unchanged)
 
     if all([from_email, to_email, smtp_server, smtp_port, app_password]):
-        summary = build_risk_digest(changed, unchanged)
         recipients = sorted({to_email, owner_email})
         send_risk_report_email(
-            from_email, recipients, smtp_server, smtp_port, app_password, REPORT_PATH, summary,
+            from_email, recipients, smtp_server, smtp_port, app_password, REPORT_PATH,
         )
 
 
