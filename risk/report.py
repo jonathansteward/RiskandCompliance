@@ -13,7 +13,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
-from risk.fair_model import RULE_CONTROLS
+from risk.fair_model import RULE_CONTROLS, RULE_MAPPING_SYS_IDS
 
 REPORT_RATINGS = {"Medium High", "High"}
 REPORT_PATH = "daily_risk_report.pdf"
@@ -171,7 +171,9 @@ def get_change_history(sn_i, sn_u, sn_p, days=90):
     for entry in response.json().get("result", []):
         key = (entry.get("documentkey"), entry.get("sys_created_on"))
         moment = moments.setdefault(key, {
-            "date": (entry.get("sys_created_on") or "")[:10],
+            # Full date+time, not just the date - more than one run can
+            # (and did, while building this) land on the same calendar day.
+            "date": entry.get("sys_created_on") or "",
             "control_label": label_by_sys_id.get(entry.get("documentkey"), "(unknown)"),
             "rating": None,
             "exposure": None,
@@ -188,7 +190,7 @@ def get_change_history(sn_i, sn_u, sn_p, days=90):
     for moment in moments.values():
         by_control.setdefault(moment["control_label"], []).append(moment)
     for control_moments in by_control.values():
-        control_moments.sort(key=lambda m: m["sort_key"])
+        control_moments.sort(key=lambda m: m["sort_key"], reverse=True)
 
     return by_control
 
@@ -255,6 +257,93 @@ def generate_executive_summary(claude_client, changed, unchanged):
     return tool_use_block.input["summary"]
 
 
+def generate_noncompliance_summaries(claude_client, findings):
+    """One Claude call covering every elevated finding - not one call per
+    control - returning a distinct non-compliance summary per record,
+    parsed back into a dict keyed by record number.
+
+    Same single-forced-tool-call pattern as generate_executive_summary();
+    the difference is the output is an array (one item per control) that
+    gets matched back to its row, instead of one blended paragraph.
+    """
+    if not claude_client or not findings:
+        return {}
+
+    findings_text = [
+        f"Record {f['number']}: {f['rule_name']} ({f['control_name']})\n{f.get('description', '')}"
+        for f in findings
+    ]
+
+    prompt = (
+        "For each finding below, write a distinct 2-3 sentence summary of why that "
+        "specific control is non-compliant, grounded only in the information given for "
+        "that record. Return exactly one summary per record number listed - do not merge "
+        "or skip any.\n\n" + "\n\n".join(findings_text)
+    )
+
+    tool = {
+        "name": "submit_noncompliance_summaries",
+        "description": "Submit one non-compliance summary per finding record.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summaries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "record_number": {"type": "string"},
+                            "summary": {"type": "string"},
+                        },
+                        "required": ["record_number", "summary"],
+                    },
+                },
+            },
+            "required": ["summaries"],
+        },
+    }
+
+    response = claude_client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=1536,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "submit_noncompliance_summaries"},
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    if response.stop_reason == "max_tokens":
+        print("Non-compliance summaries were cut off (max_tokens) - skipping.")
+        return {}
+
+    tool_use_block = next(block for block in response.content if block.type == "tool_use")
+    return {item["record_number"]: item["summary"] for item in tool_use_block.input["summaries"]}
+
+
+def get_recommended_fixes(sn_i, sn_u, sn_p, findings):
+    """Recommended fix per finding, pulled from ServiceNow's already-
+    generated remediation guidance (u_aws_config_evidence.u_remediation_steps,
+    produced by agent/remediation.py during the main pipeline run) - not
+    regenerated here. Cached per rule so cloudtrail's two controls, which
+    share one evidence trail, only cost one lookup.
+    """
+    import grc_validation
+
+    fixes_by_rule = {}
+    fixes_by_number = {}
+    for finding in findings:
+        rule_name = finding["rule_name"]
+        if rule_name not in fixes_by_rule:
+            mapping_sys_id = RULE_MAPPING_SYS_IDS.get(rule_name)
+            guidance = (
+                grc_validation.get_latest_evidence_guidance(sn_i, sn_u, sn_p, mapping_sys_id)
+                if mapping_sys_id else None
+            )
+            fixes_by_rule[rule_name] = guidance.get("remediation_steps_text", "") if guidance else ""
+        fixes_by_number[finding["number"]] = fixes_by_rule[rule_name]
+
+    return fixes_by_number
+
+
 _PAGE_SIZE = landscape(letter)
 _MARGIN = 0.6 * inch
 _RATING_COLORS = {"High": colors.HexColor("#b91c1c"), "Medium High": colors.HexColor("#c2410c")}
@@ -275,7 +364,8 @@ def _footer(canvas, doc):
     canvas.restoreState()
 
 
-def build_pdf_report(changed, unchanged, history=None, executive_summary=None, output_path=REPORT_PATH):
+def build_pdf_report(changed, unchanged, history=None, executive_summary=None,
+                      noncompliance_summaries=None, recommended_fixes=None, output_path=REPORT_PATH):
     """Render the structured PDF: a colored header band, a summary line,
     then one table each for what changed since the last run and what's
     persisting - every cell wrapped in a Paragraph so long content wraps
@@ -348,12 +438,19 @@ def build_pdf_report(changed, unchanged, history=None, executive_summary=None, o
         elements.append(Paragraph(executive_summary, summary_body_style))
         elements.append(Spacer(1, 0.35 * inch))
 
+    noncompliance_summaries = noncompliance_summaries or {}
+    recommended_fixes = recommended_fixes or {}
+
+    # Owner dropped from this table (was a constant demo value across every
+    # row, low information density) to make room for the two prose columns
+    # below, which are what actually need the width.
     col_widths = [
-        content_width * 0.27,  # Control
-        content_width * 0.16,  # Rating
-        content_width * 0.13,  # Annual Exposure
-        content_width * 0.20,  # Owner
-        content_width * 0.14,  # Record
+        content_width * 0.16,  # Control
+        content_width * 0.09,  # Rating
+        content_width * 0.27,  # Non-Compliance Summary
+        content_width * 0.27,  # Recommended Fix
+        content_width * 0.11,  # Annual Exposure
+        content_width * 0.10,  # Record
     ]
 
     def section(title, risks, empty_message):
@@ -365,7 +462,7 @@ def build_pdf_report(changed, unchanged, history=None, executive_summary=None, o
             return
 
         header = [Paragraph(h, header_cell) for h in
-                   ["Control", "Rating", "Annual Exposure", "Owner", "Record"]]
+                   ["Control", "Rating", "Non-Compliance Summary", "Recommended Fix", "Annual Exposure", "Record"]]
         data = [header]
         for risk in risks:
             rating_text = risk["rating"]
@@ -375,11 +472,14 @@ def build_pdf_report(changed, unchanged, history=None, executive_summary=None, o
                 "rating", parent=cell, textColor=_RATING_COLORS.get(risk["rating"], colors.black),
                 fontName="Helvetica-Bold",
             )
+            summary_text = noncompliance_summaries.get(risk["number"]) or risk.get("description", "").split("\n\n")[0]
+            fix_text = (recommended_fixes.get(risk["number"]) or "No remediation guidance recorded yet.")
             data.append([
                 Paragraph(f"<b>{risk['rule_name']}</b><br/>{risk['control_name']}", cell),
                 Paragraph(rating_text, rating_style),
+                Paragraph(summary_text, cell),
+                Paragraph(fix_text.replace("\n", "<br/>"), cell),
                 Paragraph(f"${risk['inherent_ale']:,.0f}/yr", cell),
-                Paragraph(risk["owner_email"], cell),
                 Paragraph(f'<link href="{risk["link"]}">{risk["number"]}</link>', link_style),
             ])
 
@@ -405,7 +505,7 @@ def build_pdf_report(changed, unchanged, history=None, executive_summary=None, o
     elements.append(Paragraph("Change History (Trend)", styles["Heading2"]))
     elements.append(Spacer(1, 0.05 * inch))
     elements.append(Paragraph(
-        "Every recorded rating/exposure change across all tracked controls, oldest first. "
+        "Every recorded rating/exposure change across all tracked controls, newest first. "
         "Native change tracking was enabled for this report; expect this section to grow "
         "day over day rather than show meaningful trends from a single day's data.",
         disclaimer_style,
@@ -418,13 +518,13 @@ def build_pdf_report(changed, unchanged, history=None, executive_summary=None, o
         control_style = ParagraphStyle(
             "control_name", parent=normal, fontSize=10, fontName="Helvetica-Bold",
         )
-        trend_widths = [content_width * 0.15, content_width * 0.425, content_width * 0.425]
+        trend_widths = [content_width * 0.22, content_width * 0.39, content_width * 0.39]
 
         for control_label, moments in history.items():
             elements.append(Paragraph(control_label, control_style))
             elements.append(Spacer(1, 0.06 * inch))
 
-            header = [Paragraph(h, header_cell) for h in ["Date", "Rating", "Annual Exposure"]]
+            header = [Paragraph(h, header_cell) for h in ["Date/Time (UTC)", "Rating", "Annual Exposure"]]
             data = [header]
             for moment in moments:
                 rating_text = "&mdash;"
@@ -477,8 +577,14 @@ def send_daily_report(sn_i, sn_u, sn_p, sn_t, slack_bot_token, slack_channel_id,
 
     changed, unchanged = get_changes_since_last_run(sn_i, sn_u, sn_p, elevated)
     history = get_change_history(sn_i, sn_u, sn_p)
+    all_findings = changed + unchanged
     executive_summary = generate_executive_summary(claude_client, changed, unchanged)
-    build_pdf_report(changed, unchanged, history, executive_summary, REPORT_PATH)
+    noncompliance_summaries = generate_noncompliance_summaries(claude_client, all_findings)
+    recommended_fixes = get_recommended_fixes(sn_i, sn_u, sn_p, all_findings)
+    build_pdf_report(
+        changed, unchanged, history, executive_summary,
+        noncompliance_summaries, recommended_fixes, REPORT_PATH,
+    )
 
     if slack_bot_token and slack_channel_id:
         send_risk_report_slack_file(slack_bot_token, slack_channel_id, REPORT_PATH)
