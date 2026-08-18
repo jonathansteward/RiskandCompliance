@@ -34,22 +34,47 @@ RISK_INPUTS = {
     },
 }
 
-# rule_name -> sys_id of the sn_risk_definition (Risk Statement) created for it
-RISK_STATEMENTS = {
-    "root-account-mfa-enabled": "778467c583720b1085a5c310feaad3c4",
-    "iam-password-policy": "489467c583720b1085a5c310feaad3d4",
-    "cloudtrail-all-read-s3-data-event-check": "c89467c583720b1085a5c310feaad3db",
-}
-
-# rule_name -> sys_id of the sn_compliance_control each rule is mapped to.
+# rule_name -> every sn_compliance_control it's mapped to, each with its own
+# risk statement. A rule can map to more than one control (cloudtrail
+# genuinely maps to two) - each gets its own sn_risk_risk record so exposure
+# and current compliance state are tracked per control, not blended.
+#
+# Each control has its OWN statement, not a shared one, because ServiceNow
+# enforces this natively: a live push against a second control sharing the
+# first's statement was rejected with a 403 from a business rule named
+# "Enforce Unique Item" - confirms one risk statement supports at most one
+# risk assessment in this instance's configuration, not the many-to-one
+# originally assumed. See SOP.md.
+#
 # Hardcoded here rather than re-queried from ServiceNow each run - only 3
-# rules are in scope today, and this mirrors u_compliance_control's actual
-# current values (a plain Reference field, not the List type originally
-# intended, so cloudtrail only carries its first control - see SOP.md).
-RULE_CONTROL_SYS_IDS = {
-    "root-account-mfa-enabled": "522e4a7c837e071085a5c310feaad3ec",
-    "iam-password-policy": "3dca5ebc83fe071085a5c310feaad349",
-    "cloudtrail-all-read-s3-data-event-check": "3f883e348336471085a5c310feaad3d1",
+# rules are in scope today.
+RULE_CONTROLS = {
+    "root-account-mfa-enabled": [
+        {
+            "sys_id": "522e4a7c837e071085a5c310feaad3ec",
+            "name": "6.5 Require MFA for Administrative Access",
+            "statement": "778467c583720b1085a5c310feaad3c4",
+        },
+    ],
+    "iam-password-policy": [
+        {
+            "sys_id": "3dca5ebc83fe071085a5c310feaad349",
+            "name": "5.2 Use Unique Passwords",
+            "statement": "489467c583720b1085a5c310feaad3d4",
+        },
+    ],
+    "cloudtrail-all-read-s3-data-event-check": [
+        {
+            "sys_id": "3f883e348336471085a5c310feaad3d1",
+            "name": "3.14 Log Sensitive Data Access",
+            "statement": "c89467c583720b1085a5c310feaad3db",
+        },
+        {
+            "sys_id": "179a59c1833e871085a5c310feaad3b2",
+            "name": "8.2 Collect Audit Logs",
+            "statement": "eff33b4d83f20b1085a5c310feaad3dc",
+        },
+    ],
 }
 
 # The "AWS" entity/asset in ServiceNow's GRC data model (sn_grc_profile) -
@@ -155,11 +180,15 @@ def get_risk_assessment(rule_name):
     }
 
 
-def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id):
-    """Compute the risk assessment for a rule and create/update its
-    sn_risk_risk record, linked to the control via u_compliance_control.
+def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id, control_name=None, statement_sys_id=None):
+    """Compute the risk assessment for a rule and create/update the
+    sn_risk_risk record for one specific control, linked via
+    u_compliance_control.
 
     Same GET-then-PATCH-or-POST pattern as update_service_now()/push_evidence().
+    Queries by (rule, control) together, not control alone, so a rule with
+    multiple controls gets one independent record per control rather than
+    them colliding on a single row.
     """
     assessment = get_risk_assessment(rule_name)
     if not assessment:
@@ -169,17 +198,18 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id):
     base_url = f"https://{sn_i}.service-now.com/api/now/table/sn_risk_risk"
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
+    label = f"{rule_name} ({control_name})" if control_name else rule_name
     query_url = f"{base_url}?sysparm_query=u_compliance_control={control_sys_id}&sysparm_limit=1"
     get_response = requests.get(query_url, auth=(sn_u, sn_p), headers=headers)
     if get_response.status_code != 200:
-        print(f"Failed to query sn_risk_risk for {rule_name}. Status: {get_response.status_code}")
+        print(f"Failed to query sn_risk_risk for {label}. Status: {get_response.status_code}")
         print(get_response.text)
         return None
 
     payload = {
         "u_compliance_control": control_sys_id,
         "profile": AWS_ENTITY_PROFILE_SYS_ID,
-        "name": f"AWS Config: {rule_name} - inherent risk",
+        "name": f"AWS Config: {label} - inherent risk",
         "description": assessment["description"],
         "inherent_sle": assessment["inherent_sle"],
         "inherent_aro": assessment["inherent_aro"],
@@ -187,7 +217,6 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id):
         "u_risk_rating": assessment["rating"],
         "u_risk_owner_email": RISK_OWNER_EMAIL,
     }
-    statement_sys_id = RISK_STATEMENTS.get(rule_name)
     if statement_sys_id:
         payload["statement"] = statement_sys_id
 
@@ -201,15 +230,33 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id):
         action = "Created"
 
     if response.status_code in (200, 201):
-        print(f"{action} risk record for {rule_name}: {assessment['rating']} (${assessment['inherent_ale']:,.0f})")
+        print(f"{action} risk record for {label}: {assessment['rating']} (${assessment['inherent_ale']:,.0f})")
         result = response.json()["result"]
         result["_rating"] = assessment["rating"]
         result["_inherent_ale"] = assessment["inherent_ale"]
         return result
     else:
-        print(f"Failed to push risk for {rule_name}. Status: {response.status_code}")
+        print(f"Failed to push risk for {label}. Status: {response.status_code}")
         print(response.text)
         return None
+
+
+def push_risk_for_rule(sn_i, sn_u, sn_p, rule_name):
+    """Push one sn_risk_risk record per control a rule is mapped to (see
+    RULE_CONTROLS) - handles the one-rule-to-many-controls case, e.g.
+    cloudtrail-all-read-s3-data-event-check mapping to two CIS controls.
+    """
+    controls = RULE_CONTROLS.get(rule_name, [])
+    if not controls:
+        print(f"No controls mapped for {rule_name}, skipping risk push.")
+        return []
+
+    return [
+        push_risk_to_servicenow(
+            sn_i, sn_u, sn_p, rule_name, control["sys_id"], control["name"], control["statement"]
+        )
+        for control in controls
+    ]
 
 
 if __name__ == "__main__":
