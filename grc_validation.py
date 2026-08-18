@@ -1,3 +1,5 @@
+import json
+
 import requests
 from requests.auth import HTTPBasicAuth
 
@@ -38,20 +40,53 @@ def get_all_control_statuses(config_client):
                     for result in res_page['EvaluationResults']:
                         rtype = result['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceType']
                         rid = result['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceId']
-                        resource_list.append({'resource_type': rtype, 'resource_id': rid})
+                        annotation = result.get('Annotation', '')
+                        recorded_time = result.get('ResultRecordedTime')
+                        resource_list.append({
+                            'resource_type': rtype,
+                            'resource_id': rid,
+                            'annotation': annotation,
+                            # ServiceNow's Table API expects "YYYY-MM-DD HH:mm:ss", not ISO 8601
+                            'result_recorded_time': recorded_time.strftime('%Y-%m-%d %H:%M:%S') if recorded_time else '',
+                        })
                 rule_info['resources'] = resource_list
 
             statuses[rule_name] = rule_info
 
     return statuses
 
+def get_rule_definition(config_client, rule_name):
+    """Fetch AWS Config's own description and configured thresholds for a
+    rule - the authoritative "what standard is this enforcing" source, so
+    nothing about the control's policy gets duplicated/hardcoded elsewhere.
+    """
+    response = config_client.describe_config_rules(ConfigRuleNames=[rule_name])
+    rule = response['ConfigRules'][0]
+
+    raw_parameters = rule.get('InputParameters', '{}')
+    input_parameters = json.loads(raw_parameters) if raw_parameters else {}
+
+    return {
+        'description': rule.get('Description', ''),
+        'source_identifier': rule.get('Source', {}).get('SourceIdentifier', ''),
+        'input_parameters': input_parameters,
+    }
+
+
 def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
-    
+
     base_url = f"https://{sn_i}.service-now.com/api/now/table/{sn_t}"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
+
+    # rule_name -> {sys_id, previous_status}. previous_status is read before
+    # it gets overwritten below, so callers can tell a brand-new failure
+    # (previous_status != NON_COMPLIANT) from one that's still failing from
+    # last run - without this, there'd be no way to know which is which
+    # once the PATCH below has already happened.
+    rule_context = {}
 
     for rule_name, info in statuses.items():
         control_status = info.get("compliance", "UNKNOWN")
@@ -65,6 +100,8 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
             if results:
                 # Rule exists — use PATCH to update
                 sys_id = results[0]['sys_id']
+                previous_status = results[0].get('u_status')
+                rule_context[rule_name] = {"sys_id": sys_id, "previous_status": previous_status}
                 patch_url = f"{base_url}/{sys_id}"
                 payload = {"u_status": control_status}
 
@@ -82,6 +119,8 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
                 }
                 post_response = requests.post(base_url, auth=(sn_u, sn_p), headers=headers, json=payload)
                 if post_response.status_code in [200, 201]:
+                    sys_id = post_response.json()["result"]["sys_id"]
+                    rule_context[rule_name] = {"sys_id": sys_id, "previous_status": None}
                     print(f"Created: {rule_name} - {control_status}")
                 else:
                     print(f"Failed to create {rule_name}. Status: {post_response.status_code}")
@@ -89,3 +128,88 @@ def update_service_now(sn_i, sn_t, statuses, sn_u, sn_p):
         else:
             print(f"Failed to query for {rule_name}. Status: {get_response.status_code}")
             print(get_response.text)
+
+    return rule_context
+
+
+def get_latest_evidence_guidance(sn_i, sn_u, sn_p, sys_id):
+    """Fetch the most recent evidence row's guidance for a control.
+
+    Used when a rule is still failing the same way it was last run, so the
+    pipeline can carry forward already-generated guidance instead of paying
+    for a fresh Claude call on a finding that hasn't changed.
+    """
+    base_url = f"https://{sn_i}.service-now.com/api/now/table/u_aws_config_evidence"
+    headers = {"Accept": "application/json"}
+    query_url = (
+        f"{base_url}?sysparm_query=u_control_mapping={sys_id}^ORDERBYDESCsys_created_on"
+        f"&sysparm_limit=1"
+    )
+
+    response = requests.get(query_url, auth=(sn_u, sn_p), headers=headers)
+    if response.status_code != 200:
+        return None
+
+    results = response.json().get("result", [])
+    if not results:
+        return None
+
+    row = results[0]
+    if not row.get("u_standard_summary"):
+        return None
+
+    return {
+        "standard_summary": row.get("u_standard_summary", ""),
+        "gap_summary": row.get("u_gap_summary", ""),
+        "remediation_steps_text": row.get("u_remediation_steps", ""),
+    }
+
+
+def push_evidence(sn_i, sn_u, sn_p, statuses, rule_context, guidance_by_rule=None):
+    """Insert one evidence row per non-compliant resource per run into
+    u_aws_config_evidence, including remediation guidance when available.
+
+    Always a POST, never a PATCH — each run's finding is its own row, so a
+    prior finding is never overwritten. That's what lets an auditor open a
+    control's record in ServiceNow and see the full history of what failed,
+    when, and why, without leaving the platform. Guidance travels with the
+    evidence itself so ServiceNow-side issue creation can pull it straight
+    from here, rather than Python having to find and patch the issue later.
+    """
+    guidance_by_rule = guidance_by_rule or {}
+    base_url = f"https://{sn_i}.service-now.com/api/now/table/u_aws_config_evidence"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    for rule_name, info in statuses.items():
+        if info.get("compliance") != "NON_COMPLIANT":
+            continue
+
+        sys_id = rule_context.get(rule_name, {}).get("sys_id")
+        if not sys_id:
+            print(f"No sys_id for {rule_name}, skipping evidence push.")
+            continue
+
+        guidance = guidance_by_rule.get(rule_name, {})
+
+        for resource in info.get("resources", []):
+            payload = {
+                "u_control_mapping": sys_id,
+                "u_resource_type": resource.get("resource_type", ""),
+                "u_resource_id": resource.get("resource_id", ""),
+                "u_annotation": resource.get("annotation", ""),
+                "u_compliance_status": "NON_COMPLIANT",
+                "u_captured_at": resource.get("result_recorded_time", ""),
+                "u_standard_summary": guidance.get("standard_summary", ""),
+                "u_gap_summary": guidance.get("gap_summary", ""),
+                "u_remediation_steps": guidance.get("remediation_steps_text", ""),
+            }
+
+            response = requests.post(base_url, auth=(sn_u, sn_p), headers=headers, json=payload)
+            if response.status_code in (200, 201):
+                print(f"Evidence recorded: {rule_name} - {resource.get('resource_id')}")
+            else:
+                print(f"Failed to push evidence for {rule_name} - {resource.get('resource_id')}. Status: {response.status_code}")
+                print(response.text)

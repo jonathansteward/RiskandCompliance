@@ -2,7 +2,7 @@ name: Upload AWS Control Statuses to ServiceNow
 
 on:
   schedule:
-    - cron: '0 14 * * 5'   # every week
+    - cron: '0 13 * * *'   # 8am Central (UTC-5); does not adjust for DST
   workflow_dispatch:     # manual trigger optional
 
 jobs:
@@ -17,6 +17,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
     steps:
       - name: Checkout code
