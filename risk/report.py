@@ -79,6 +79,60 @@ def get_elevated_risks(sn_i, sn_u, sn_p, sn_t):
     return elevated
 
 
+def get_other_noncompliant(sn_i, sn_u, sn_p, sn_t, already_shown_numbers):
+    """Every other currently non-compliant rule not already covered by the
+    elevated (Medium High/High) findings above - either risk-scored but
+    rated lower, or not control-mapped/risk-scored at all (e.g. rules
+    RULE_CONTROLS doesn't cover yet, like subnet-auto-assign-public-ip-disabled).
+
+    Non-compliant controls shouldn't disappear from the report just
+    because they're not elevated - they belong in their own, lower-
+    priority section rather than being silently dropped.
+    """
+    headers = {"Accept": "application/json"}
+    status_url = f"https://{sn_i}.service-now.com/api/now/table/{sn_t}"
+    risk_url = f"https://{sn_i}.service-now.com/api/now/table/sn_risk_risk"
+
+    response = requests.get(
+        f"{status_url}?sysparm_fields=u_aws_config_rule_name,u_status,u_compliance_control",
+        auth=(sn_u, sn_p), headers=headers,
+    )
+
+    others = []
+    for row in response.json().get("result", []):
+        if row.get("u_status") != "NON_COMPLIANT":
+            continue
+
+        rule_name = row.get("u_aws_config_rule_name")
+        control_sys_id = row.get("u_compliance_control")
+        if isinstance(control_sys_id, dict):
+            control_sys_id = control_sys_id.get("value")
+
+        entry = {
+            "rule_name": rule_name, "control_name": None, "rating": "Not risk-scored",
+            "inherent_ale": None, "number": None, "link": None,
+        }
+
+        if control_sys_id:
+            risk_response = requests.get(
+                f"{risk_url}?sysparm_query=u_compliance_control={control_sys_id}&sysparm_limit=1",
+                auth=(sn_u, sn_p), headers=headers,
+            )
+            risk_results = risk_response.json().get("result", [])
+            if risk_results:
+                record = risk_results[0]
+                if record.get("number") in already_shown_numbers:
+                    continue  # already covered in the elevated section
+                entry["rating"] = record.get("u_risk_rating") or "Not rated"
+                entry["inherent_ale"] = float(record.get("inherent_ale") or 0)
+                entry["number"] = record.get("number")
+                entry["link"] = _servicenow_link(sn_i, record.get("sys_id"))
+
+        others.append(entry)
+
+    return others
+
+
 def get_changes_since_last_run(sn_i, sn_u, sn_p, elevated_risks, hours=24):
     """Split elevated risks into changed-since-last-run vs. persisting,
     using sys_audit - ServiceNow's native field-change history, enabled on
@@ -365,7 +419,8 @@ def _footer(canvas, doc):
 
 
 def build_pdf_report(changed, unchanged, history=None, executive_summary=None,
-                      noncompliance_summaries=None, recommended_fixes=None, output_path=REPORT_PATH):
+                      noncompliance_summaries=None, recommended_fixes=None, other_noncompliant=None,
+                      output_path=REPORT_PATH):
     """Render the structured PDF: a colored header band, a summary line,
     then one table each for what changed since the last run and what's
     persisting - every cell wrapped in a Paragraph so long content wraps
@@ -499,6 +554,44 @@ def build_pdf_report(changed, unchanged, history=None, executive_summary=None,
     section("New / Changed Since Last Run", changed, "No rating changes since the last run.")
     section("Persisting Risks (Unchanged)", unchanged, "No unchanged elevated risks.")
 
+    # Non-compliant controls that aren't elevated - lower-rated, or not yet
+    # risk-scored at all - still shown, just not mixed in with the
+    # Medium High/High findings above.
+    elements.append(Paragraph("Other Non-Compliant Controls", styles["Heading2"]))
+    elements.append(Spacer(1, 0.05 * inch))
+    if not other_noncompliant:
+        elements.append(Paragraph("No other non-compliant controls right now.", normal))
+        elements.append(Spacer(1, 0.3 * inch))
+    else:
+        other_widths = [content_width * 0.4, content_width * 0.2, content_width * 0.2, content_width * 0.2]
+        header = [Paragraph(h, header_cell) for h in ["Rule", "Rating", "Annual Exposure", "Record"]]
+        data = [header]
+        for entry in other_noncompliant:
+            exposure_text = f"${entry['inherent_ale']:,.0f}/yr" if entry["inherent_ale"] is not None else "&mdash;"
+            record_cell = (
+                Paragraph(f'<link href="{entry["link"]}">{entry["number"]}</link>', link_style)
+                if entry["link"] else Paragraph("&mdash;", cell)
+            )
+            data.append([
+                Paragraph(entry["rule_name"], cell),
+                Paragraph(entry["rating"], cell),
+                Paragraph(exposure_text, cell),
+                record_cell,
+            ])
+
+        other_table = Table(data, colWidths=other_widths, repeatRows=1)
+        other_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f9fafb")]),
+        ]))
+        elements.append(other_table)
+        elements.append(Spacer(1, 0.35 * inch))
+
     # Trend section: every recorded change across all tracked controls, not
     # just today's window. Deliberately thin right now - change history was
     # only enabled today - and fills in naturally as the pipeline runs.
@@ -571,8 +664,11 @@ def send_daily_report(sn_i, sn_u, sn_p, sn_t, slack_bot_token, slack_channel_id,
     from notifications.notify import send_risk_report_email, send_risk_report_slack_file
 
     elevated = get_elevated_risks(sn_i, sn_u, sn_p, sn_t)
-    if not elevated:
-        print("No non-compliant Medium High/High risks today - no report sent.")
+    other_noncompliant = get_other_noncompliant(
+        sn_i, sn_u, sn_p, sn_t, {risk["number"] for risk in elevated}
+    )
+    if not elevated and not other_noncompliant:
+        print("No non-compliant controls today - no report sent.")
         return
 
     changed, unchanged = get_changes_since_last_run(sn_i, sn_u, sn_p, elevated)
@@ -583,7 +679,7 @@ def send_daily_report(sn_i, sn_u, sn_p, sn_t, slack_bot_token, slack_channel_id,
     recommended_fixes = get_recommended_fixes(sn_i, sn_u, sn_p, all_findings)
     build_pdf_report(
         changed, unchanged, history, executive_summary,
-        noncompliance_summaries, recommended_fixes, REPORT_PATH,
+        noncompliance_summaries, recommended_fixes, other_noncompliant, REPORT_PATH,
     )
 
     if slack_bot_token and slack_channel_id:

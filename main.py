@@ -35,6 +35,17 @@ def main():
     # non-compliant. A rule that was already non-compliant last run carries
     # forward its existing guidance instead of paying for another Claude
     # call on a finding that hasn't changed.
+    def _generate_fresh_guidance(rule_name, info):
+        rule_definition = grc_validation.get_rule_definition(config_client, rule_name)
+        guidance = remediation.get_remediation_guidance(
+            claude_client, rule_name, rule_definition, info.get("resources", [])
+        )
+        return {
+            "standard_summary": guidance["standard_summary"],
+            "gap_summary": guidance["gap_summary"],
+            "remediation_steps_text": remediation.format_remediation_steps(guidance["remediation_steps"]),
+        }
+
     guidance_by_rule = {}
     for rule_name, info in statuses.items():
         if info.get("compliance") != "NON_COMPLIANT":
@@ -47,21 +58,21 @@ def main():
         is_new_failure = context["previous_status"] != "NON_COMPLIANT"
 
         if is_new_failure and claude_client:
-            rule_definition = grc_validation.get_rule_definition(config_client, rule_name)
-            guidance = remediation.get_remediation_guidance(
-                claude_client, rule_name, rule_definition, info.get("resources", [])
-            )
-            guidance_by_rule[rule_name] = {
-                "standard_summary": guidance["standard_summary"],
-                "gap_summary": guidance["gap_summary"],
-                "remediation_steps_text": remediation.format_remediation_steps(guidance["remediation_steps"]),
-            }
+            guidance_by_rule[rule_name] = _generate_fresh_guidance(rule_name, info)
             print(f"Generated new remediation guidance for {rule_name} (new failure).")
         else:
             carried_forward = grc_validation.get_latest_evidence_guidance(SN_I, SN_U, SN_P, context["sys_id"])
             if carried_forward:
                 guidance_by_rule[rule_name] = carried_forward
                 print(f"Carried forward existing guidance for {rule_name} (still failing).")
+            elif claude_client:
+                # Still-failing, but no prior evidence row ever had
+                # guidance - e.g. the rule was already non-compliant
+                # before this feature existed, so it never hit the
+                # new-failure branch above. Generate it once now instead
+                # of staying permanently blank.
+                guidance_by_rule[rule_name] = _generate_fresh_guidance(rule_name, info)
+                print(f"No prior guidance found for {rule_name} - generated fresh (first time).")
             else:
                 print(f"No prior guidance to carry forward for {rule_name} yet.")
 
