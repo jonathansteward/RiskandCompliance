@@ -2,8 +2,7 @@ name: Upload AWS Control Statuses to ServiceNow
 
 on:
   schedule:
-    - cron: '0 13 * * *'   # 8am Central during CDT (UTC-5)
-    - cron: '0 14 * * *'   # 8am Central during CST (UTC-6)
+    - cron: '0 13 * * *'   # 8am Central (UTC-5); does not adjust for DST
   workflow_dispatch:     # manual trigger optional
 
 jobs:
@@ -24,42 +23,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Determine if this is the correct schedule for current Central time
-        id: dst_check
-        run: |
-          # Two cron triggers exist (13:00 and 14:00 UTC) so 8am Central
-          # fires correctly whether it's currently CDT or CST - GitHub
-          # Actions cron itself doesn't shift with daylight saving. This
-          # step figures out which of the two just fired is actually
-          # correct for today, and skips the other one. Manual runs
-          # (workflow_dispatch) always proceed regardless of schedule.
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          current_tz=$(TZ='America/Chicago' date +%Z)
-          if [ "$current_tz" = "CDT" ] && [ "${{ github.event.schedule }}" = "0 13 * * *" ]; then
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          elif [ "$current_tz" = "CST" ] && [ "${{ github.event.schedule }}" = "0 14 * * *" ]; then
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping - current Central time zone is $current_tz, this trigger (${{ github.event.schedule }}) isn't the active one."
-          fi
-
       - name: Set up Python
-        if: steps.dst_check.outputs.proceed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install dependencies
-        if: steps.dst_check.outputs.proceed == 'true'
         run:
           pip install -r requirements.txt
 
       - name: Run sync script
-        if: steps.dst_check.outputs.proceed == 'true'
         run:
           python main.py
