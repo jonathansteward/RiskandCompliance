@@ -19,7 +19,7 @@ jobs:
       dirs: ${{ steps.detect.outputs.dirs }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -54,10 +54,10 @@ jobs:
         dir: ${{ fromJson(needs.detect-changed-examples.outputs.dirs) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: "1.15.8"
           terraform_wrapper: false
@@ -95,6 +95,7 @@ jobs:
       - name: Install Conftest
         run: |
           curl -sSLo conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/download/v0.69.0/conftest_0.69.0_Linux_x86_64.tar.gz
+          echo "96fc2fbf11f0afde51256647127e6f00a64ce839a4d9a0a1aef2426c0e6f4b3f  conftest.tar.gz" | sha256sum -c -
           tar -xzf conftest.tar.gz conftest
           chmod +x conftest
           sudo mv conftest /usr/local/bin/conftest
