@@ -41,6 +41,45 @@ RISK_STATEMENTS = {
     "cloudtrail-all-read-s3-data-event-check": "c89467c583720b1085a5c310feaad3db",
 }
 
+# rule_name -> sys_id of the sn_compliance_control each rule is mapped to.
+# Hardcoded here rather than re-queried from ServiceNow each run - only 3
+# rules are in scope today, and this mirrors u_compliance_control's actual
+# current values (a plain Reference field, not the List type originally
+# intended, so cloudtrail only carries its first control - see SOP.md).
+RULE_CONTROL_SYS_IDS = {
+    "root-account-mfa-enabled": "522e4a7c837e071085a5c310feaad3ec",
+    "iam-password-policy": "3dca5ebc83fe071085a5c310feaad349",
+    "cloudtrail-all-read-s3-data-event-check": "3f883e348336471085a5c310feaad3d1",
+}
+
+# The "AWS" entity/asset in ServiceNow's GRC data model (sn_grc_profile) -
+# the same profile the CIS controls are already mapped under. Verified live:
+# sn_compliance_control's `profile` field on a known control resolves to
+# this sys_id, which itself resolves to name="AWS".
+AWS_ENTITY_PROFILE_SYS_ID = "e4cc257c833ec31085a5c310feaad30c"
+
+# Made up for this exercise - a fictional named risk owner on the reserved
+# example.com domain, so it can't be mistaken for a real deliverable inbox.
+RISK_OWNER_EMAIL = "priya.natarajan@example.com"
+
+# Risk rating scale (annualized loss exposure -> label), as specified:
+# max expected value $1,000,000, five bands each $200K wide except the
+# open-ended top band.
+RISK_RATING_BANDS = [
+    (200_000, "Low"),
+    (400_000, "Medium Low"),
+    (600_000, "Medium"),
+    (800_000, "Medium High"),
+]
+
+
+def rate_risk(ale):
+    """Map an annualized loss exposure figure to the defined 5-tier label."""
+    for threshold, label in RISK_RATING_BANDS:
+        if ale < threshold:
+            return label
+    return "High"
+
 
 def _ordered_triangular(t):
     """Convert (min, likely, max) to random.triangular(low, high, mode) argument order."""
@@ -100,17 +139,19 @@ def get_risk_assessment(rule_name):
     cf_mode = inputs["contact_frequency"][1]
     poa_mode = inputs["probability_of_action"][1]
     lm_mode = inputs["loss_magnitude"][1]
+    # ServiceNow recalculates inherent_ale itself as inherent_sle x
+    # inherent_aro (confirmed live - it silently overwrites whatever's sent
+    # here), so rate and send the matching point estimate rather than the
+    # Monte Carlo median, which would otherwise be discarded anyway.
+    inherent_ale = distribution["point_estimate"]
 
     return {
         "distribution": distribution,
         "description": description,
         "inherent_sle": lm_mode,
         "inherent_aro": round(cf_mode * poa_mode, 4),
-        # ServiceNow recalculates inherent_ale itself as inherent_sle x
-        # inherent_aro (confirmed live - it silently overwrites whatever's
-        # sent here), so send the matching point estimate rather than the
-        # Monte Carlo median, which would otherwise be discarded anyway.
-        "inherent_ale": distribution["point_estimate"],
+        "inherent_ale": inherent_ale,
+        "rating": rate_risk(inherent_ale),
     }
 
 
@@ -137,11 +178,14 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id):
 
     payload = {
         "u_compliance_control": control_sys_id,
+        "profile": AWS_ENTITY_PROFILE_SYS_ID,
         "name": f"AWS Config: {rule_name} - inherent risk",
         "description": assessment["description"],
         "inherent_sle": assessment["inherent_sle"],
         "inherent_aro": assessment["inherent_aro"],
         "inherent_ale": assessment["inherent_ale"],
+        "u_risk_rating": assessment["rating"],
+        "u_risk_owner_email": RISK_OWNER_EMAIL,
     }
     statement_sys_id = RISK_STATEMENTS.get(rule_name)
     if statement_sys_id:
@@ -157,8 +201,11 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id):
         action = "Created"
 
     if response.status_code in (200, 201):
-        print(f"{action} risk record for {rule_name}: median ${assessment['inherent_ale']:,.0f}")
-        return response.json()["result"]
+        print(f"{action} risk record for {rule_name}: {assessment['rating']} (${assessment['inherent_ale']:,.0f})")
+        result = response.json()["result"]
+        result["_rating"] = assessment["rating"]
+        result["_inherent_ale"] = assessment["inherent_ale"]
+        return result
     else:
         print(f"Failed to push risk for {rule_name}. Status: {response.status_code}")
         print(response.text)
@@ -171,7 +218,7 @@ if __name__ == "__main__":
     # no ServiceNow calls, just verifying the math/output before wiring in.
     for rule_name in RISK_INPUTS:
         assessment = get_risk_assessment(rule_name)
-        print(f"\n{rule_name}")
+        print(f"\n{rule_name} - rating: {assessment['rating']}")
         print(f"  {assessment['description']}")
         print(f"  point_estimate=${assessment['distribution']['point_estimate']:,.0f}  "
               f"mean=${assessment['distribution']['mean']:,.0f}")
