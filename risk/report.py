@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -106,67 +106,142 @@ def get_changes_since_last_run(sn_i, sn_u, sn_p, elevated_risks, hours=24):
     return changed, unchanged
 
 
+_PAGE_SIZE = landscape(letter)
+_MARGIN = 0.6 * inch
+_RATING_COLORS = {"High": colors.HexColor("#b91c1c"), "Medium High": colors.HexColor("#c2410c")}
+
+
+def _footer(canvas, doc):
+    """Page number + generation timestamp + confidentiality note, drawn on
+    every page - the one piece that needs the canvas directly rather than
+    a platypus flowable, since it's fixed to the page, not the flow."""
+    canvas.saveState()
+    canvas.setFont("Helvetica", 8)
+    canvas.setFillColor(colors.HexColor("#6b7280"))
+    text = (
+        f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}  "
+        f"·  Confidential  ·  Page {doc.page}"
+    )
+    canvas.drawCentredString(_PAGE_SIZE[0] / 2, 0.4 * inch, text)
+    canvas.restoreState()
+
+
 def build_pdf_report(changed, unchanged, output_path=REPORT_PATH):
-    """Render the structured PDF: title/methodology note, then a table for
-    what changed since the last run and a table for what's persisting.
+    """Render the structured PDF: a colored header band, a summary line,
+    then one table each for what changed since the last run and what's
+    persisting - every cell wrapped in a Paragraph so long content wraps
+    within its column instead of overflowing into the next one.
     """
     styles = getSampleStyleSheet()
-    normal = styles["Normal"]
-    link_style = ParagraphStyle("link", parent=normal, textColor=colors.HexColor("#1a73e8"))
+    normal = ParagraphStyle("normal", parent=styles["Normal"], fontSize=9, leading=12)
+    cell = ParagraphStyle("cell", parent=normal, fontSize=8.5, leading=11)
+    header_cell = ParagraphStyle(
+        "header_cell", parent=cell, textColor=colors.white, fontName="Helvetica-Bold"
+    )
+    link_style = ParagraphStyle("link", parent=cell, textColor=colors.HexColor("#1a73e8"))
+    title_style = ParagraphStyle(
+        "title", parent=styles["Title"], textColor=colors.white, alignment=0, fontSize=20
+    )
+    caption_style = ParagraphStyle(
+        "caption", parent=normal, textColor=colors.HexColor("#e5e7eb"), fontSize=10
+    )
+    disclaimer_style = ParagraphStyle(
+        "disclaimer", parent=normal, textColor=colors.HexColor("#6b7280"), fontSize=8, leading=11
+    )
 
-    doc = SimpleDocTemplate(output_path, pagesize=letter, topMargin=0.75 * inch, bottomMargin=0.75 * inch)
+    doc = SimpleDocTemplate(
+        output_path, pagesize=_PAGE_SIZE,
+        topMargin=0, bottomMargin=0.75 * inch, leftMargin=_MARGIN, rightMargin=_MARGIN,
+    )
+    content_width = _PAGE_SIZE[0] - 2 * _MARGIN
+
+    # Header band: full-bleed dark bar with title + date + at-a-glance counts
+    total = len(changed) + len(unchanged)
+    summary_text = (
+        f"{total} elevated finding{'s' if total != 1 else ''} today "
+        f"&mdash; {len(changed)} new/changed &middot; {len(unchanged)} persisting"
+    )
+    header_table = Table(
+        [[Paragraph("Daily Elevated Risk Report", title_style)],
+         [Paragraph(datetime.now(timezone.utc).strftime("%B %d, %Y"), caption_style)],
+         [Paragraph(summary_text, caption_style)]],
+        colWidths=[_PAGE_SIZE[0]],
+    )
+    header_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#111827")),
+        ("LEFTPADDING", (0, 0), (-1, -1), _MARGIN),
+        ("RIGHTPADDING", (0, 0), (-1, -1), _MARGIN),
+        ("TOPPADDING", (0, 0), (0, 0), 22),
+        ("BOTTOMPADDING", (0, 0), (0, 0), 4),
+        ("TOPPADDING", (0, 1), (0, 2), 2),
+        ("BOTTOMPADDING", (0, 2), (0, 2), 20),
+    ]))
+
     elements = [
-        Paragraph("Daily Elevated Risk Report", styles["Title"]),
-        Paragraph(datetime.now(timezone.utc).strftime("%B %d, %Y"), normal),
-        Spacer(1, 0.15 * inch),
+        header_table,
+        Spacer(1, 0.25 * inch),
         Paragraph(
             "Non-compliant AWS controls currently rated Medium High or High, based on a "
             "FAIR-informed Monte Carlo risk model. Loss ranges are illustrative, reasoned "
             "from published industry breach-cost benchmarks, not this organization's own "
             "incident history.",
-            normal,
+            disclaimer_style,
         ),
         Spacer(1, 0.3 * inch),
     ]
 
+    col_widths = [
+        content_width * 0.27,  # Control
+        content_width * 0.16,  # Rating
+        content_width * 0.13,  # Annual Exposure
+        content_width * 0.20,  # Owner
+        content_width * 0.14,  # Record
+    ]
+
     def section(title, risks, empty_message):
         elements.append(Paragraph(title, styles["Heading2"]))
+        elements.append(Spacer(1, 0.05 * inch))
         if not risks:
             elements.append(Paragraph(empty_message, normal))
-            elements.append(Spacer(1, 0.25 * inch))
+            elements.append(Spacer(1, 0.3 * inch))
             return
 
-        header = ["Control", "Rating", "Annual Exposure", "Owner", "Record"]
+        header = [Paragraph(h, header_cell) for h in
+                   ["Control", "Rating", "Annual Exposure", "Owner", "Record"]]
         data = [header]
         for risk in risks:
-            rating_cell = risk["rating"]
+            rating_text = risk["rating"]
             if "previous_rating" in risk:
-                rating_cell = f"{risk['previous_rating']} -> {risk['rating']}"
+                rating_text = f"{risk['previous_rating']} &rarr; {risk['rating']}"
+            rating_style = ParagraphStyle(
+                "rating", parent=cell, textColor=_RATING_COLORS.get(risk["rating"], colors.black),
+                fontName="Helvetica-Bold",
+            )
             data.append([
-                Paragraph(f"{risk['rule_name']}<br/>({risk['control_name']})", normal),
-                rating_cell,
-                f"${risk['inherent_ale']:,.0f}",
-                risk["owner_email"],
+                Paragraph(f"<b>{risk['rule_name']}</b><br/>{risk['control_name']}", cell),
+                Paragraph(rating_text, rating_style),
+                Paragraph(f"${risk['inherent_ale']:,.0f}/yr", cell),
+                Paragraph(risk["owner_email"], cell),
                 Paragraph(f'<link href="{risk["link"]}">{risk["number"]}</link>', link_style),
             ])
 
-        table = Table(data, colWidths=[1.9 * inch, 1.1 * inch, 1.1 * inch, 1.6 * inch, 0.8 * inch])
+        table = Table(data, colWidths=col_widths, repeatRows=1)
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f9fafb")]),
         ]))
         elements.append(table)
-        elements.append(Spacer(1, 0.3 * inch))
+        elements.append(Spacer(1, 0.35 * inch))
 
     section("New / Changed Since Last Run", changed, "No rating changes since the last run.")
     section("Persisting Risks (Unchanged)", unchanged, "No unchanged elevated risks.")
 
-    doc.build(elements)
+    doc.build(elements, onFirstPage=_footer, onLaterPages=_footer)
     return output_path
 
 
