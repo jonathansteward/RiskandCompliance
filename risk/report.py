@@ -356,13 +356,14 @@ def build_pdf_report(changed, unchanged, history=None, output_path=REPORT_PATH):
     return output_path
 
 
-def send_daily_report(sn_i, sn_u, sn_p, sn_t, webhook_url, from_email, to_email, owner_email,
-                       smtp_server, smtp_port, app_password):
+def send_daily_report(sn_i, sn_u, sn_p, sn_t, slack_bot_token, slack_channel_id,
+                       from_email, to_email, owner_email, smtp_server, smtp_port, app_password):
     """Full daily pipeline: pull elevated risks from ServiceNow, diff
-    against audit history, build the PDF, and deliver via Slack + email.
+    against audit history, build the PDF, and deliver via Slack + email -
+    both just the PDF itself, no text digest in either channel.
     No-ops cleanly if there's nothing Medium High/High to report.
     """
-    from notifications.notify import build_risk_digest, send_risk_digest_slack, send_risk_report_email
+    from notifications.notify import send_risk_report_email, send_risk_report_slack_file
 
     elevated = get_elevated_risks(sn_i, sn_u, sn_p, sn_t)
     if not elevated:
@@ -373,8 +374,8 @@ def send_daily_report(sn_i, sn_u, sn_p, sn_t, webhook_url, from_email, to_email,
     history = get_change_history(sn_i, sn_u, sn_p)
     build_pdf_report(changed, unchanged, history, REPORT_PATH)
 
-    if webhook_url:
-        send_risk_digest_slack(webhook_url, changed, unchanged)
+    if slack_bot_token and slack_channel_id:
+        send_risk_report_slack_file(slack_bot_token, slack_channel_id, REPORT_PATH)
 
     if all([from_email, to_email, smtp_server, smtp_port, app_password]):
         recipients = sorted({to_email, owner_email})
@@ -394,7 +395,8 @@ if __name__ == "__main__":
         sn_u=os.getenv("SN_U"),
         sn_p=os.getenv("SN_P"),
         sn_t=os.getenv("SN_T"),
-        webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
+        slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
+        slack_channel_id=os.getenv("SLACK_CHANNEL_ID"),
         from_email=os.getenv("EMAIL_FROM"),
         to_email=os.getenv("EMAIL_TO"),
         owner_email="priya.natarajan@example.com",

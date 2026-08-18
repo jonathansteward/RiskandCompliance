@@ -1,3 +1,4 @@
+import os
 import smtplib
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -83,69 +84,49 @@ def send_email_alert(from_email, to_email, smtp_server, smtp_port, app_password,
     print("Email alert sent.")
 
 
-def build_risk_digest(changed, unchanged):
-    """Slack-friendly digest of elevated-risk findings, split into what
-    changed since the last run and what's still persisting - and with a
-    clickable link to the ServiceNow record for each, using Slack's
-    <url|text> mrkdwn link syntax.
+def send_risk_report_slack_file(bot_token, channel_id, pdf_path):
+    """Upload the daily risk report PDF directly into a Slack channel.
 
-    changed/unchanged: lists of dicts with rule_name, control_name, rating,
-    inherent_ale, owner_email, number, link (and previous_rating for changed).
+    Incoming Webhooks (the SLACK_WEBHOOK_URL path used elsewhere in this
+    file) can only post text/blocks - they have no file-upload capability
+    at all. Actually delivering a file requires a Bot Token and Slack's
+    current external-upload flow: request an upload URL, upload the bytes
+    to it, then finalize/share it to the channel. Deliberately not using
+    the older files.upload endpoint, which Slack has been deprecating for
+    newer apps.
     """
-    lines = []
+    filename = os.path.basename(pdf_path)
+    file_size = os.path.getsize(pdf_path)
+    headers = {"Authorization": f"Bearer {bot_token}"}
 
-    if changed:
-        lines.append("*New / Changed Since Last Run:*")
-        for risk in changed:
-            lines.append(
-                f"• {risk['rule_name']} ({risk['control_name']}): "
-                f"{risk.get('previous_rating', '(new)')} -> {risk['rating']} "
-                f"(${risk['inherent_ale']:,.0f}/yr) - <{risk['link']}|{risk['number']}>"
-            )
-
-    if unchanged:
-        if lines:
-            lines.append("")
-        lines.append("*Persisting (Unchanged):*")
-        for risk in unchanged:
-            lines.append(
-                f"• {risk['rule_name']} ({risk['control_name']}): {risk['rating']} "
-                f"(${risk['inherent_ale']:,.0f}/yr) - <{risk['link']}|{risk['number']}>"
-            )
-
-    return "\n".join(lines)
-
-
-def send_risk_digest_slack(webhook_url, changed, unchanged):
-    """Post the daily elevated-risk digest to Slack, with clickable links
-    back to each ServiceNow record.
-
-    Only fires when there's at least one Medium High/High finding - this is
-    the severity gate, not a report of every drift event.
-    """
-    if not changed and not unchanged:
+    url_response = requests.get(
+        "https://slack.com/api/files.getUploadURLExternal",
+        headers=headers,
+        params={"filename": filename, "length": file_size},
+    ).json()
+    if not url_response.get("ok"):
+        print(f"Failed to get Slack upload URL: {url_response.get('error')}")
         return
 
-    report = build_risk_digest(changed, unchanged)
-    payload = {
-        "blocks": [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "Daily Risk Report: Elevated Findings"},
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": report},
-            },
-        ]
-    }
+    with open(pdf_path, "rb") as f:
+        upload_response = requests.post(url_response["upload_url"], files={"file": f})
+    if upload_response.status_code != 200:
+        print(f"Failed to upload PDF to Slack. Status: {upload_response.status_code}")
+        return
 
-    response = requests.post(webhook_url, json=payload)
-    if response.status_code != 200:
-        print(f"Failed to send risk digest Slack alert. Status: {response.status_code}")
-        print(response.text)
+    complete_response = requests.post(
+        "https://slack.com/api/files.completeUploadExternal",
+        headers={**headers, "Content-Type": "application/json"},
+        json={
+            "files": [{"id": url_response["file_id"], "title": "Daily Risk Report"}],
+            "channel_id": channel_id,
+        },
+    ).json()
+
+    if complete_response.get("ok"):
+        print("Risk report PDF uploaded to Slack.")
     else:
-        print("Risk digest Slack alert sent.")
+        print(f"Failed to complete Slack upload: {complete_response.get('error')}")
 
 
 def send_risk_report_email(from_email, to_emails, smtp_server, smtp_port, app_password, pdf_path):

@@ -80,7 +80,8 @@ def main():
     # was actually written above, and no-ops cleanly if nothing qualifies.
     send_daily_report(
         sn_i=SN_I, sn_u=SN_U, sn_p=SN_P, sn_t=SN_T,
-        webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
+        slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
+        slack_channel_id=os.getenv("SLACK_CHANNEL_ID"),
         from_email=os.getenv("EMAIL_FROM"),
         to_email=os.getenv("EMAIL_TO"),
         owner_email="priya.natarajan@example.com",
