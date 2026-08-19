@@ -21,17 +21,20 @@ import grc_validation
 RISK_INPUTS = {
     "root-account-mfa-enabled": {
         "contact_frequency": (0.5, 1, 3),          # targeted root-credential attack attempts/year
-        "probability_of_action": (0.6, 0.85, 0.95),  # high - a compromised root credential is high-value
+        "probability_of_action_noncompliant": (0.6, 0.85, 0.95),  # high - a compromised root credential is high-value
+        "probability_of_action_compliant": (0.005, 0.02, 0.05),   # MFA - published figures put this near a ~99% reduction in successful account-compromise attempts
         "loss_magnitude": (300_000, 1_000_000, 3_000_000),  # full account takeover - the most catastrophic control in scope
     },
     "iam-password-policy": {
         "contact_frequency": (2, 8, 15),           # credential-stuffing/brute-force attempts/year - common, low-effort
-        "probability_of_action": (0.3, 0.6, 0.8),
+        "probability_of_action_noncompliant": (0.3, 0.6, 0.8),
+        "probability_of_action_compliant": (0.05, 0.15, 0.3),     # strong length/complexity/rotation policy meaningfully raises attacker cost, but brute-force/reuse attempts can still occasionally succeed
         "loss_magnitude": (20_000, 150_000, 300_000),  # single IAM user compromise, compounding with weak policy
     },
     "cloudtrail-all-read-s3-data-event-check": {
         "contact_frequency": (0.5, 2, 5),          # attempted S3 data-object reads/year
-        "probability_of_action": (0.2, 0.5, 0.7),
+        "probability_of_action_noncompliant": (0.2, 0.5, 0.7),
+        "probability_of_action_compliant": (0.05, 0.15, 0.3),     # logging mainly buys detection/response speed, not prevention - so the reduction is real but smaller than MFA's
         "loss_magnitude": (80_000, 650_000, 1_200_000),  # amplified by lack of detection/response visibility
     },
 }
@@ -155,54 +158,84 @@ def calculate_inherent_risk_distribution(contact_frequency, probability_of_actio
     }
 
 
-def get_risk_assessment(rule_name):
-    """Run the Monte Carlo for one rule and return the distribution plus a
-    ready-to-use description string, or None if this rule has no defined
-    risk inputs yet."""
+def get_risk_assessment(rule_name, is_compliant):
+    """Run the Monte Carlo for one rule and return both inherent (control-
+    agnostic worst case, using probability_of_action_noncompliant - i.e. as
+    if this control provided zero protection) and residual (accounts for
+    the control's actual current effectiveness) distributions, or None if
+    this rule has no defined risk inputs yet.
+
+    A non-compliant control provides no risk reduction, so residual equals
+    inherent in that case - there is only ever one real Monte Carlo input
+    set in play (probability_of_action_noncompliant) unless the control is
+    actually compliant.
+    """
     inputs = RISK_INPUTS.get(rule_name)
     if not inputs:
         return None
 
-    distribution = calculate_inherent_risk_distribution(**inputs)
+    contact_frequency = inputs["contact_frequency"]
+    loss_magnitude = inputs["loss_magnitude"]
+    poa_noncompliant = inputs["probability_of_action_noncompliant"]
+    poa_compliant = inputs["probability_of_action_compliant"]
 
-    description = (
-        f"Annualized loss exposure: ${distribution['p10']:,.0f}-${distribution['p90']:,.0f} "
-        f"(90% confidence range), median ${distribution['p50']:,.0f}. "
-        f"Based on {distribution['iterations']:,} Monte Carlo samples of illustrative "
-        f"threat-frequency and loss-magnitude ranges, reasoned from published industry "
-        f"breach-cost benchmarks - not this organization's own incident history."
+    inherent = calculate_inherent_risk_distribution(contact_frequency, poa_noncompliant, loss_magnitude)
+    residual = (
+        calculate_inherent_risk_distribution(contact_frequency, poa_compliant, loss_magnitude)
+        if is_compliant else inherent
     )
 
-    cf_mode = inputs["contact_frequency"][1]
-    poa_mode = inputs["probability_of_action"][1]
-    lm_mode = inputs["loss_magnitude"][1]
-    # ServiceNow recalculates inherent_ale itself as inherent_sle x
-    # inherent_aro (confirmed live - it silently overwrites whatever's sent
-    # here), so rate and send the matching point estimate rather than the
-    # Monte Carlo median, which would otherwise be discarded anyway.
-    inherent_ale = distribution["point_estimate"]
+    cf_mode = contact_frequency[1]
+    lm_mode = loss_magnitude[1]
+    poa_mode = (poa_compliant if is_compliant else poa_noncompliant)[1]
+
+    # ServiceNow recalculates *_ale itself as *_sle x *_aro (confirmed live
+    # - it silently overwrites whatever's sent here), so rate and send the
+    # matching point estimate rather than the Monte Carlo median, which
+    # would otherwise be discarded anyway.
+    inherent_ale = inherent["point_estimate"]
+    residual_ale = residual["point_estimate"] if is_compliant else inherent_ale
+
+    description = (
+        f"Inherent exposure (if this control provided no protection at all): "
+        f"${inherent['p10']:,.0f}-${inherent['p90']:,.0f} (90% confidence range), median ${inherent['p50']:,.0f}. "
+        + (
+            f"Residual exposure with the control currently compliant: "
+            f"${residual['p10']:,.0f}-${residual['p90']:,.0f}, median ${residual['p50']:,.0f}. "
+            if is_compliant else
+            "Control is currently non-compliant, so no risk reduction is being realized - residual exposure equals inherent. "
+        )
+        + f"Based on {inherent['iterations']:,} Monte Carlo samples of illustrative threat-frequency, "
+        f"control-effectiveness, and loss-magnitude ranges, reasoned from published industry breach-cost "
+        f"benchmarks - not this organization's own incident history."
+    )
 
     return {
-        "distribution": distribution,
-        "description": description,
         "inherent_sle": lm_mode,
-        "inherent_aro": round(cf_mode * poa_mode, 4),
+        "inherent_aro": round(cf_mode * poa_noncompliant[1], 4),
         "inherent_ale": inherent_ale,
-        "rating": rate_risk(inherent_ale),
+        "residual_sle": lm_mode,
+        "residual_aro": round(cf_mode * poa_mode, 4),
+        "residual_ale": residual_ale,
+        "description": description,
+        "rating": rate_risk(residual_ale),
     }
 
 
-def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id, control_name=None, statement_sys_id=None):
+def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id, control_name=None, statement_sys_id=None, is_compliant=False):
     """Compute the risk assessment for a rule and create/update the
     sn_risk_risk record for one specific control, linked via
     u_compliance_control.
 
-    Same GET-then-PATCH-or-POST pattern as update_service_now()/push_evidence().
-    Queries by (rule, control) together, not control alone, so a rule with
-    multiple controls gets one independent record per control rather than
-    them colliding on a single row.
+    Pushed every run regardless of compliance state - a compliant control
+    gets a real, lower residual-risk assessment instead of the record being
+    left alone or (unreliably) deactivated. Same GET-then-PATCH-or-POST
+    pattern as update_service_now()/push_evidence(). Queries by (rule,
+    control) together, not control alone, so a rule with multiple controls
+    gets one independent record per control rather than them colliding on a
+    single row.
     """
-    assessment = get_risk_assessment(rule_name)
+    assessment = get_risk_assessment(rule_name, is_compliant)
     if not assessment:
         print(f"No risk inputs defined for {rule_name}, skipping.")
         return None
@@ -220,12 +253,15 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id, control
 
     description = assessment["description"]
     mapping_sys_id = RULE_MAPPING_SYS_IDS.get(rule_name)
-    if mapping_sys_id:
+    if mapping_sys_id and not is_compliant:
         # Denormalize the latest evidence gap onto the risk record itself,
         # rather than joining u_aws_config_evidence in at report time -
         # that table is one row per resource per run by design, so a join
         # would multiply this control into as many rows as it has
         # accumulated history instead of showing one row per control.
+        # Skipped when compliant - evidence rows only exist for past
+        # failures, so surfacing one here would read as a current gap that
+        # no longer exists.
         latest = grc_validation.get_latest_evidence_guidance(sn_i, sn_u, sn_p, mapping_sys_id)
         if latest and latest.get("gap_summary"):
             description += f"\n\nCurrent gap: {latest['gap_summary']}"
@@ -233,15 +269,20 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id, control
     payload = {
         "u_compliance_control": control_sys_id,
         "profile": AWS_ENTITY_PROFILE_SYS_ID,
-        "name": f"AWS Config: {label} - inherent risk",
+        "name": f"AWS Config: {label} - risk assessment",
         "description": description,
         "inherent_sle": assessment["inherent_sle"],
         "inherent_aro": assessment["inherent_aro"],
         "inherent_ale": assessment["inherent_ale"],
+        "residual_sle": assessment["residual_sle"],
+        "residual_aro": assessment["residual_aro"],
+        "residual_ale": assessment["residual_ale"],
         "u_risk_rating": assessment["rating"],
         "u_risk_owner_email": RISK_OWNER_EMAIL,
-        # Currently non-compliant, so this record is a live/current risk -
-        # see set_risk_active() for the counterpart that flips this off.
+        # Always current now - a compliant control gets a real, lower
+        # residual assessment on every run rather than needing this record
+        # flipped off (see IMPLEMENTATION_STEPS.md: a direct PATCH setting
+        # active=false was confirmed live to be silently discarded anyway).
         "active": "true",
     }
     if statement_sys_id:
@@ -257,10 +298,11 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id, control
         action = "Created"
 
     if response.status_code in (200, 201):
-        print(f"{action} risk record for {label}: {assessment['rating']} (${assessment['inherent_ale']:,.0f})")
+        print(f"{action} risk record for {label}: {assessment['rating']} (residual ${assessment['residual_ale']:,.0f}, inherent ${assessment['inherent_ale']:,.0f})")
         result = response.json()["result"]
         result["_rating"] = assessment["rating"]
         result["_inherent_ale"] = assessment["inherent_ale"]
+        result["_residual_ale"] = assessment["residual_ale"]
         return result
     else:
         print(f"Failed to push risk for {label}. Status: {response.status_code}")
@@ -268,7 +310,7 @@ def push_risk_to_servicenow(sn_i, sn_u, sn_p, rule_name, control_sys_id, control
         return None
 
 
-def push_risk_for_rule(sn_i, sn_u, sn_p, rule_name):
+def push_risk_for_rule(sn_i, sn_u, sn_p, rule_name, is_compliant):
     """Push one sn_risk_risk record per control a rule is mapped to (see
     RULE_CONTROLS) - handles the one-rule-to-many-controls case, e.g.
     cloudtrail-all-read-s3-data-event-check mapping to two CIS controls.
@@ -280,70 +322,31 @@ def push_risk_for_rule(sn_i, sn_u, sn_p, rule_name):
 
     return [
         push_risk_to_servicenow(
-            sn_i, sn_u, sn_p, rule_name, control["sys_id"], control["name"], control["statement"]
+            sn_i, sn_u, sn_p, rule_name, control["sys_id"], control["name"], control["statement"],
+            is_compliant=is_compliant,
         )
         for control in controls
     ]
 
 
-def set_risk_active(sn_i, sn_u, sn_p, control_sys_id, active):
-    """Flip a control's existing risk record active/inactive without
-    recomputing the assessment - used when a control's compliance status
-    means its risk record shouldn't be treated as current anymore (e.g. the
-    control is compliant again), where a fresh Monte Carlo run would be
-    wasted work.
-    """
-    base_url = f"https://{sn_i}.service-now.com/api/now/table/sn_risk_risk"
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-
-    query_url = f"{base_url}?sysparm_query=u_compliance_control={control_sys_id}&sysparm_limit=1"
-    get_response = requests.get(query_url, auth=(sn_u, sn_p), headers=headers)
-    if get_response.status_code != 200:
-        print(f"Failed to query sn_risk_risk for {control_sys_id}. Status: {get_response.status_code}")
-        return None
-
-    results = get_response.json().get("result", [])
-    if not results:
-        return None  # no existing risk record for this control - nothing to flip
-
-    sys_id = results[0]["sys_id"]
-    response = requests.patch(
-        f"{base_url}/{sys_id}", auth=(sn_u, sn_p), headers=headers,
-        json={"active": "true" if active else "false"},
-    )
-    if response.status_code == 200:
-        print(f"Set active={active} on risk record for control {control_sys_id}")
-        return response.json()["result"]
-    else:
-        print(f"Failed to set active on risk record for {control_sys_id}. Status: {response.status_code}")
-        return None
-
-
 def sync_risk_for_rule(sn_i, sn_u, sn_p, rule_name, is_non_compliant):
-    """Daily entry point: push a fresh assessment (active=true) when the
-    rule is currently non-compliant, or mark its existing risk record(s)
-    inactive - without recomputing - when it isn't.
+    """Daily entry point: push a fresh risk assessment for every mapped
+    control on every run, compliant or not - a compliant control gets a
+    real, lower residual-risk figure instead of the record being left
+    alone or (unreliably) marked inactive.
     """
-    controls = RULE_CONTROLS.get(rule_name, [])
-    if not controls:
-        return []
-
-    if is_non_compliant:
-        return push_risk_for_rule(sn_i, sn_u, sn_p, rule_name)
-
-    return [
-        set_risk_active(sn_i, sn_u, sn_p, control["sys_id"], active=False)
-        for control in controls
-    ]
+    return push_risk_for_rule(sn_i, sn_u, sn_p, rule_name, is_compliant=not is_non_compliant)
 
 
 if __name__ == "__main__":
     # Manual test harness: python -m risk.fair_model
-    # Runs the Monte Carlo for each defined rule and prints the result -
-    # no ServiceNow calls, just verifying the math/output before wiring in.
+    # Runs the Monte Carlo for each defined rule, both compliant and
+    # non-compliant, and prints the result - no ServiceNow calls, just
+    # verifying the math/output before wiring in.
     for rule_name in RISK_INPUTS:
-        assessment = get_risk_assessment(rule_name)
-        print(f"\n{rule_name} - rating: {assessment['rating']}")
-        print(f"  {assessment['description']}")
-        print(f"  point_estimate=${assessment['distribution']['point_estimate']:,.0f}  "
-              f"mean=${assessment['distribution']['mean']:,.0f}")
+        for is_compliant in (False, True):
+            assessment = get_risk_assessment(rule_name, is_compliant)
+            state = "compliant" if is_compliant else "non-compliant"
+            print(f"\n{rule_name} [{state}] - rating: {assessment['rating']}")
+            print(f"  {assessment['description']}")
+            print(f"  inherent_ale=${assessment['inherent_ale']:,.0f}  residual_ale=${assessment['residual_ale']:,.0f}")

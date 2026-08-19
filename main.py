@@ -79,9 +79,10 @@ def main():
     # Record per-resource evidence for non-compliant rules, including guidance
     grc_validation.push_evidence(SN_I, SN_U, SN_P, statuses, rule_context, guidance_by_rule)
 
-    # Sync risk assessments for every rule with a mapped control: push a
-    # fresh assessment when currently non-compliant, or mark existing
-    # records inactive (without recomputing) when they aren't.
+    # Sync risk assessments for every rule with a mapped control - pushes a
+    # fresh assessment every run regardless of compliance state, so a
+    # compliant control gets a real, lower residual-risk figure instead of
+    # its record being left stale.
     for rule_name in RULE_CONTROLS:
         is_non_compliant = statuses.get(rule_name, {}).get("compliance") == "NON_COMPLIANT"
         sync_risk_for_rule(SN_I, SN_U, SN_P, rule_name, is_non_compliant)
